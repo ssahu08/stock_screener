@@ -9,3 +9,12 @@ __pycache__/
 # Ignore local environment or secret keys
 .env
 .streamlit/secrets.toml
+config/keys.py
+
+# Ignore Database and cached tokens
+data/
+*.duckdb
+
+# Ignore Fyers API logs
+*.log
+logs/
