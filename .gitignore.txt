@@ -1,0 +1,11 @@
+# Ignore Python cache
+__pycache__/
+*.pyc
+
+# Ignore runtime reports & generated CSVs
+*.csv
+*.json
+
+# Ignore local environment or secret keys
+.env
+.streamlit/secrets.toml
