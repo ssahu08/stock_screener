@@ -164,9 +164,31 @@ STRATEGY_REGISTRY = {
     "1": {
         "name": "Hilega Milega",
         "compute_func": compute_hilega_milega,
-        "buy_condition": lambda df: (df["RSI"] > df["WMA"]) & (df["EMA"] > df["WMA"]) & (df["RSI"] > STRATEGY_SETTINGS["hilega_milega_rsi_min"]),
-        "sell_condition": lambda df: (df["RSI"] < df["WMA"]) & (df["EMA"] < df["WMA"]),
-        "metrics_formatter": lambda df: f"RSI: {round(df.iloc[-1]['RSI'],1)} | WMA: {round(df.iloc[-1]['WMA'],1)}",
+        # STRATEGY RULES:
+        # RSI > 50 = bullish (longs only), RSI < 50 = bearish (shorts only)
+        # WMA > 50 = trend intact in strength zone; WMA < 50 = trend intact in bearish zone
+        # Close > previous high = entry confirmation for longs
+        # Close < previous low = entry confirmation for shorts
+        # WMA crossing 50 in opposite direction = stop-loss trigger
+        # EMA touching RSI = profit-taking warning (not hard exit)
+        "buy_condition": lambda df: (
+            (df["RSI"] > 50) & 
+            (df["WMA"] > 50) & 
+            (df["Close"] > df["High"].shift(1)) &
+            (len(df) >= 2)  # Ensure enough data for shift
+        ),
+        "sell_condition": lambda df: (
+            (df["RSI"] < 50) & 
+            (df["WMA"] < 50) & 
+            (df["Close"] < df["Low"].shift(1)) &
+            (len(df) >= 2)  # Ensure enough data for shift
+        ),
+        "metrics_formatter": lambda df: (
+            f"RSI: {round(df.iloc[-1]['RSI'],1)} | "
+            f"WMA: {round(df.iloc[-1]['WMA'],1)} | "
+            f"EMA: {round(df.iloc[-1]['EMA'],1)} | "
+            f"Trend: {'Bullish' if df.iloc[-1]['RSI'] > 50 else 'Bearish'}"
+        ),
         "sort_metric": lambda df: df.iloc[-1]["RSI"]
     },
     "2": {
