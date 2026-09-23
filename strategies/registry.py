@@ -5,6 +5,14 @@
 
 from strategies.base import Strategy
 from strategies.hilega_milega import HilegaMilegaStrategy
+from strategies.volcano import (
+    VolcanoWatch,
+    VolcanoBlast,
+    CoilBreak,
+    DarvasBox,
+    VolcanoBlast60,
+    VolcanoSnap,
+)
 
 # Auto-register all subclasses of Strategy discovered in the strategies/ folder
 # This makes adding new strategies as simple as creating a new file.
@@ -22,12 +30,38 @@ def register_strategy(strategy_class):
         "metrics_formatter": instance.format_metrics,
         "sort_metric": instance.sort_value,
         "strategy_obj": instance,  # keep reference for utilities
+        "timeframe": instance.timeframe,  # "weekly" | "daily" | "60min"
     }
     return strategy_class
 
 # Register built-in strategies
 @register_strategy
 class _BuiltInHilegaMilega(HilegaMilegaStrategy):
+    pass
+
+# --- Squeeze/breakout test bench ------------------------------------------
+@register_strategy
+class _BuiltInVolcanoWatch(VolcanoWatch):
+    pass
+
+@register_strategy
+class _BuiltInVolcanoBlast(VolcanoBlast):
+    pass
+
+@register_strategy
+class _BuiltInCoilBreak(CoilBreak):
+    pass
+
+@register_strategy
+class _BuiltInDarvasBox(DarvasBox):
+    pass
+
+@register_strategy
+class _BuiltInVolcanoBlast60(VolcanoBlast60):
+    pass
+
+@register_strategy
+class _BuiltInVolcanoSnap(VolcanoSnap):
     pass
 
 # At module load time, populate registry

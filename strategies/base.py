@@ -29,11 +29,22 @@ class Strategy(ABC):
 
     @property
     def min_bars(self) -> int:
-        """Minimum number of weekly bars needed for reliable signals.
+        """Minimum number of bars needed for reliable signals.
         Override if your strategy needs more history.
         Default: 22 (enough for a 21-period WMA + 1 confirmation bar)
         """
         return 22
+
+    @property
+    def timeframe(self) -> str:
+        """Bar size the engine feeds into compute()/buy_signal()/sell_signal():
+        "weekly" (default) | "daily" | "60min".
+
+        The engine fetches daily data ONCE per ticker and derives weekly
+        frames by resampling; "60min" additionally triggers an intraday
+        fetch. Multiple strategies in one scan share these fetches.
+        """
+        return "weekly"
 
     @abstractmethod
     def compute(self, df: pd.DataFrame) -> pd.DataFrame:

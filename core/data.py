@@ -160,6 +160,10 @@ def fetch_historical_data(fyers: fyersModel.FyersModel,
 
         # Sort oldest to newest (important for rolling calculations)
         df = df.sort_index(ascending=True)
+        # Fyers sometimes returns duplicate candles (observed on 60-min:
+        # the same session twice) — label-aligned pandas ops explode on
+        # duplicate labels, so keep only the last copy of each timestamp.
+        df = df[~df.index.duplicated(keep="last")]
         return df
 
     except Exception:

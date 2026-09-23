@@ -31,6 +31,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 
 # Project root on sys.path so `core`, `strategies`, `storage`, `config` resolve
@@ -54,6 +55,9 @@ from strategies.registry import get_strategy, list_strategies
 from storage.db import init_db, save_scan_results
 
 LOG_DIR = os.path.join(BASE_DIR, "logs")
+
+# Fyers caps intraday history ranges (resolutions 1..240 min) at 100 days
+SIXTY_MIN_HISTORY_DAYS = 100
 
 # Serialize console output from worker threads
 _print_lock = threading.Lock()
@@ -96,128 +100,184 @@ def get_fyers_client():
 # Per-ticker evaluation
 # ------------------------------------------------------------------
 
+def _signal_row(
+    strategy,
+    df: pd.DataFrame,
+    ticker: str,
+    scan_id: str,
+    scan_time: datetime.datetime,
+    forward_weeks: int,
+) -> Dict[str, Any]:
+    """Indicators -> signal -> backtest stats for one frame.
+
+    Returns a row with EXACTLY storage.db.SCAN_COLUMNS plus an internal
+    "sort_value" (dropped by db.py).
+    """
+    df = strategy.compute(df)
+    buy_series = strategy.buy_signal(df)
+    sell_series = strategy.sell_signal(df)
+
+    is_buy = bool(buy_series.iloc[-1])
+    is_sell = bool(sell_series.iloc[-1])
+    signal = "BUY" if is_buy else ("SELL" if is_sell else "HOLD")
+
+    # --- Prices / latest-bar change -------------------------------------
+    latest_close = float(df["Close"].iloc[-1])
+    prev_close = float(df["Close"].iloc[-2])
+    bar_change = round((latest_close - prev_close) / prev_close * 100, 2)
+
+    # --- Historical backtest (exclude the live bar) ----------------------
+    # forward_weeks is expressed in WEEKS — convert to this strategy's
+    # bar count so "avg 4W fwd" stays truthful on daily / 60-min frames.
+    bars_per_week = {"weekly": 1, "daily": 5, "60min": 32}.get(
+        strategy.timeframe, 1
+    )
+    fwd_bars = forward_weeks * bars_per_week
+    hist_mask = buy_series.iloc[:-1]
+    fwd_ret = (
+        (df["Close"].shift(-fwd_bars) - df["Close"]) / df["Close"] * 100
+    )
+    # Positional numpy mask (one slot per row). Label-aligned boolean
+    # masks EXPLODE when a frame has duplicate index labels — Fyers
+    # occasionally returns duplicate intraday timestamps (verified: 7
+    # duplicated hourly candles on a 505-row 60-min frame -> mask of 543).
+    eligible = np.zeros(len(df), dtype=bool)
+    hm = hist_mask.to_numpy(dtype=bool)
+    fwd_ok = fwd_ret.notna().to_numpy()
+    eligible[: len(hm)] = hm & fwd_ok[: len(hm)]
+    n_signals = int(eligible.sum())
+    fwd_vals = fwd_ret.to_numpy()
+    avg_ret = (
+        round(float(fwd_vals[eligible].mean()), 2) if n_signals else 0.0
+    )
+
+    if n_signals:
+        if "Timestamp" in df.columns:
+            dates = pd.to_datetime(df.loc[eligible, "Timestamp"])
+        else:
+            # Daily / 60-min frames are indexed by Timestamp — wrap in a
+            # Series because a DatetimeIndex has no .dt accessor.
+            dates = pd.Series(pd.to_datetime(df.index[eligible]))
+        date_list = dates.dt.strftime("%Y-%m-%d").tolist()
+        signal_dates = ", ".join(date_list[-10:])
+        if len(date_list) > 10:
+            signal_dates = f"...{signal_dates}"
+    else:
+        signal_dates = ""
+
+    # --- Zone breakout / profit warning (optional strategy hooks) --------
+    zone = {}
+    zone_fn = getattr(strategy, "detect_zone_breakout", None)
+    if callable(zone_fn):
+        zone = zone_fn(df) or {}
+
+    warn = False
+    warn_fn = getattr(strategy, "profit_taking_warning", None)
+    if callable(warn_fn):
+        warn = bool(warn_fn(df))
+
+    clean_ticker = ticker.replace("NSE:", "").replace("-EQ", "")
+
+    # Row keys inserted in SCAN_COLUMNS order (also enforced by db.py)
+    return {
+        "scan_id": scan_id,
+        "scan_time": scan_time,
+        "strategy_name": strategy.name,
+        "ticker": clean_ticker,
+        "current_price": round(latest_close, 2),
+        "signal": signal,
+        "key_metrics": strategy.format_metrics(df),
+        "weekly_change_pct": bar_change,
+        # same value as hist_avg_return: avg 4w forward return of this
+        # ticker's historical signals (used by DB win-rate aggregation)
+        "forward_4w_ret": avg_ret,
+        "hist_signal_count": n_signals,
+        "hist_avg_return": avg_ret,
+        "hist_signal_dates": signal_dates,
+        "zone_breakout": bool(zone.get("broke_out", False)),
+        "profit_taking_warning": warn,
+        "breakout_direction": zone.get("direction"),
+        "stop_loss_price": (
+            round(zone["stop_loss"], 2) if zone.get("stop_loss") else None
+        ),
+        # Internal rank key — dropped by storage.db (canonical columns only)
+        "sort_value": float(strategy.sort_value(df)),
+    }
+
+
 def _evaluate_ticker(
     fyers,
     ticker: str,
-    strategy,
-    min_bars: int,
+    specs,                      # List[(strategy_obj, scan_id, scan_time)]
     min_history_days: int,
     forward_weeks: int,
-    scan_id: str,
-    scan_time: datetime.datetime,
-) -> Tuple[Optional[Dict[str, Any]], str]:
-    """Fetch -> weekly resample -> indicators -> signal -> backtest stats.
+) -> List[Tuple[str, Optional[Dict[str, Any]], str]]:
+    """Fetch data ONCE per needed resolution -> evaluate EVERY strategy.
 
-    Returns (row, reason):
-      - (row_dict, "ok") on success — row has EXACTLY storage.db.SCAN_COLUMNS
-        plus an internal "sort_value" (dropped by db.py)
-      - (None, reason) to skip, where reason is one of:
-        "fetch_failed"      API/network failure even after retries
-        "insufficient_data" valid response but too few bars
-        "exception:<msg>"   unexpected error
+    Multi-strategy bench scans share the expensive part (API fetches):
+    daily data is fetched at most once per ticker, weekly frames are
+    resampled from it, and the 60-min frame is fetched only if some
+    selected strategy uses it.
+
+    Returns a list aligned with `specs`, each (scan_id, row, reason):
+      - reason "ok"               row has EXACTLY SCAN_COLUMNS
+      - reason "fetch_failed"     API/network failure even after retries
+      - reason "insufficient_data" valid response but too few bars
+      - reason "exception:<msg>"  unexpected error
     """
     import time
 
-    # --- Fetch with backoff retries (throttled 4-worker load can trip Fyers)
-    max_attempts = 3
-    daily = None
-    for attempt in range(max_attempts):
-        daily = fetch_historical_data(
-            fyers, ticker, days=min_history_days, resolution="1D"
-        )
-        if daily is not None:
-            break
-        if attempt < max_attempts - 1:
-            time.sleep(1.5 * (attempt + 1))  # 1.5s, 3.0s backoff
+    need_daily = any(s.timeframe in ("daily", "weekly") for s, _, _ in specs)
+    need_60 = any(s.timeframe == "60min" for s, _, _ in specs)
 
-    if daily is None:
-        return None, "fetch_failed"
-    if daily.empty:
-        return None, "insufficient_data"
+    def _fetch(resolution: str, days: int):
+        """Backoff retries (throttled 4-worker load can trip Fyers).
+        None = retryable failure; DataFrame = got a response (may be empty)."""
+        for attempt in range(3):
+            out = fetch_historical_data(
+                fyers, ticker, days=days, resolution=resolution
+            )
+            if out is not None:
+                return out
+            if attempt < 2:
+                time.sleep(1.5 * (attempt + 1))  # 1.5s, 3.0s backoff
+        return None
 
-    try:
-        weekly = resample_to_weekly(daily)
-        if weekly.empty or len(weekly) < min_bars:
-            return None, "insufficient_data"
+    daily = _fetch("1D", min_history_days) if need_daily else None
+    # Fyers hard-caps intraday ranges (resolutions 1..240 min) at 100 days
+    # — verified empirically: larger ranges return code -50 every time.
+    sixty = _fetch("60", SIXTY_MIN_HISTORY_DAYS) if need_60 else None
 
-        # --- Indicators ------------------------------------------------
-        weekly = strategy.compute(weekly)
-        buy_series = strategy.buy_signal(weekly)
-        sell_series = strategy.sell_signal(weekly)
-
-        is_buy = bool(buy_series.iloc[-1])
-        is_sell = bool(sell_series.iloc[-1])
-        signal = "BUY" if is_buy else ("SELL" if is_sell else "HOLD")
-
-        # --- Prices / weekly change -------------------------------------
-        latest_close = float(weekly["Close"].iloc[-1])
-        prev_close = float(weekly["Close"].iloc[-2])
-        weekly_change = round((latest_close - prev_close) / prev_close * 100, 2)
-
-        # --- Historical backtest (exclude the live bar) ------------------
-        hist_mask = buy_series.iloc[:-1]
-        fwd_ret = (
-            (weekly["Close"].shift(-forward_weeks) - weekly["Close"])
-            / weekly["Close"]
-            * 100
-        )
-        eligible = hist_mask & fwd_ret.notna()
-        n_signals = int(eligible.sum())
-        avg_ret = round(float(fwd_ret[eligible].mean()), 2) if n_signals else 0.0
-
-        if n_signals:
-            if "Timestamp" in weekly.columns:
-                dates = pd.to_datetime(weekly.loc[eligible, "Timestamp"])
-            else:  # fallback: datetime index
-                dates = pd.to_datetime(weekly.index[eligible.values])
-            date_list = dates.dt.strftime("%Y-%m-%d").tolist()
-            signal_dates = ", ".join(date_list[-10:])
-            if len(date_list) > 10:
-                signal_dates = f"...{signal_dates}"
+    # --- Frames per timeframe (None marks a failed fetch) ----------------
+    frames: Dict[str, Optional[pd.DataFrame]] = {}
+    if need_daily:
+        frames["daily"] = daily
+        if daily is None:
+            frames["weekly"] = None
+        elif daily.empty:
+            frames["weekly"] = pd.DataFrame()
         else:
-            signal_dates = ""
+            frames["weekly"] = resample_to_weekly(daily)
+    if need_60:
+        frames["60min"] = sixty
 
-        # --- Zone breakout / profit warning (optional strategy hooks) ----
-        zone = {}
-        zone_fn = getattr(strategy, "detect_zone_breakout", None)
-        if callable(zone_fn):
-            zone = zone_fn(weekly) or {}
-
-        warn = False
-        warn_fn = getattr(strategy, "profit_taking_warning", None)
-        if callable(warn_fn):
-            warn = bool(warn_fn(weekly))
-
-        clean_ticker = ticker.replace("NSE:", "").replace("-EQ", "")
-
-        # Row keys inserted in SCAN_COLUMNS order (also enforced by db.py)
-        return {
-            "scan_id": scan_id,
-            "scan_time": scan_time,
-            "strategy_name": strategy.name,
-            "ticker": clean_ticker,
-            "current_price": round(latest_close, 2),
-            "signal": signal,
-            "key_metrics": strategy.format_metrics(weekly),
-            "weekly_change_pct": weekly_change,
-            # same value as hist_avg_return: avg 4w forward return of this
-            # ticker's historical signals (used by DB win-rate aggregation)
-            "forward_4w_ret": avg_ret,
-            "hist_signal_count": n_signals,
-            "hist_avg_return": avg_ret,
-            "hist_signal_dates": signal_dates,
-            "zone_breakout": bool(zone.get("broke_out", False)),
-            "profit_taking_warning": warn,
-            "breakout_direction": zone.get("direction"),
-            "stop_loss_price": (
-                round(zone["stop_loss"], 2) if zone.get("stop_loss") else None
-            ),
-            # Internal rank key — dropped by storage.db (canonical columns only)
-            "sort_value": float(strategy.sort_value(weekly)),
-        }, "ok"
-
-    except Exception as e:
-        return None, f"exception:{type(e).__name__}: {e}"
+    # --- Evaluate each strategy on its own frame -------------------------
+    out: List[Tuple[str, Optional[Dict[str, Any]], str]] = []
+    for strategy, scan_id, scan_time in specs:
+        df = frames.get(strategy.timeframe)
+        if df is None:
+            out.append((scan_id, None, "fetch_failed"))
+        elif df.empty or len(df) < strategy.min_bars:
+            out.append((scan_id, None, "insufficient_data"))
+        else:
+            try:
+                row = _signal_row(
+                    strategy, df, ticker, scan_id, scan_time, forward_weeks
+                )
+                out.append((scan_id, row, "ok"))
+            except Exception as e:
+                out.append((scan_id, None, f"exception:{type(e).__name__}: {e}"))
+    return out
 
 
 # ------------------------------------------------------------------
@@ -232,21 +292,37 @@ def scan_universe(
     max_price: Optional[float] = None,
     send_alert: bool = True,
 ) -> Dict[str, Any]:
-    """Run one strategy across the NSE universe. Returns a results dict."""
-    strategy = get_strategy(strategy_key)
-    if strategy is None:
-        return {
-            "error": f"Unknown strategy '{strategy_key}'. "
-                     f"Available: {list(list_strategies().keys())}"
-        }
+    """Run one or more strategies across the NSE universe.
+
+    `strategy_key` may be a comma-separated list (e.g.
+    "volcano_watch,volcano_blast") to run a test-bench comparison —
+    data is fetched once per ticker and shared by all strategies.
+    Returns a single results dict, or {"multi": True, "scans": [...]}
+    for a bench run.
+    """
+    keys = [k.strip() for k in str(strategy_key).split(",") if k.strip()]
+    if not keys:
+        return {"error": "No strategy selected."}
+    resolved = []
+    for k in keys:
+        entry = get_strategy(k)
+        if entry is None:
+            return {
+                "error": f"Unknown strategy '{k}'. "
+                         f"Available: {list(list_strategies().keys())}"
+            }
+        resolved.append(entry["strategy_obj"])
 
     cfg = UNIVERSE_SETTINGS
-    strategy_obj = strategy["strategy_obj"]
     min_price = cfg["min_price"] if min_price is None else min_price
     max_price = cfg["max_price"] if max_price is None else max_price
 
     scan_time = datetime.datetime.now()
-    scan_id = f"{strategy_obj.key.upper()}_{scan_time.strftime('%Y%m%d_%H%M%S')}"
+    stamp = scan_time.strftime("%Y%m%d_%H%M%S")
+    specs = [  # (strategy_obj, scan_id, scan_time) — one entry per strategy
+        (obj, f"{obj.key.upper()}_{stamp}", scan_time) for obj in resolved
+    ]
+    multi = len(specs) > 1
 
     # --- 1. Universe ------------------------------------------------
     if universe == "nifty50":
@@ -262,16 +338,17 @@ def scan_universe(
         universe_list = raw_tickers[:5]  # don't hard-fail an empty scan
 
     total = len(universe_list)
+    label = ", ".join(s[0].name for s in specs) if multi else specs[0][0].name
     _log(
-        f"\n🚀 {strategy_obj.name} scan: {total} stocks "
+        f"\n🚀 {label} scan: {total} stocks "
         f"(₹{min_price:,.0f}–₹{max_price:,.0f}), "
         f"{cfg['max_workers']} workers"
     )
     _log("-" * 60)
 
-    # --- 3. Evaluate each ticker --------------------------------------
-    rows: List[Dict[str, Any]] = []
-    skips: Counter = Counter()
+    # --- 3. Evaluate each ticker (all strategies per fetch) -------------
+    rows_by: List[List[Dict[str, Any]]] = [[] for _ in specs]
+    skips_by: List[Counter] = [Counter() for _ in specs]
     done = 0
     progress_step = max(1, total // 20)
 
@@ -281,12 +358,9 @@ def scan_universe(
                 _evaluate_ticker,
                 fyers,
                 tk,
-                strategy_obj,
-                cfg["min_weekly_bars"],
+                specs,
                 cfg["min_history_days"],
                 cfg["forward_weeks"],
-                scan_id,
-                scan_time,
             ): tk
             for tk in universe_list
         }
@@ -296,70 +370,97 @@ def scan_universe(
             if done % progress_step == 0 or done == total:
                 _log(f"⏳ Progress: [{done}/{total}] scanned")
 
-            row, reason = fut.result()
-            if row is None:
-                skips[reason.split(":")[0]] += 1
-                if reason.startswith("exception"):
-                    skips["_last_error"] = reason  # keep one sample for report
-                continue
-            rows.append(row)
-            if row["signal"] == "BUY":
-                _log(
-                    f"🟢 BUY {row['ticker']} @ ₹{row['current_price']} | "
-                    f"{row['key_metrics']}"
-                )
+            for i, (_sid, row, reason) in enumerate(fut.result()):
+                if row is None:
+                    skips_by[i][reason.split(":")[0]] += 1
+                    if reason.startswith("exception"):
+                        # keep one sample for the report
+                        skips_by[i]["_last_error"] = reason
+                    continue
+                rows_by[i].append(row)
+                if row["signal"] == "BUY":
+                    tag = f"[{specs[i][0].name}] " if multi else ""
+                    _log(
+                        f"🟢 {tag}BUY {row['ticker']} @ ₹{row['current_price']} | "
+                        f"{row['key_metrics']}"
+                    )
 
     # Skip breakdown — surfaces silent data problems instead of hiding them
-    if skips:
+    for i, (strat, _sid, _stime) in enumerate(specs):
+        skips = skips_by[i]
+        total_skipped = sum(v for k, v in skips.items() if not k.startswith("_"))
+        if not total_skipped:
+            continue
         parts = [
             f"{k.replace('_', ' ')}: {v}"
             for k, v in sorted(skips.items())
             if not k.startswith("_") and v
         ]
-        _log(f"⚠️  Skipped {sum(v for k, v in skips.items() if not k.startswith('_'))} "
-             f"of {total} ({'; '.join(parts)})")
+        tag = f"[{strat.name}] " if multi else ""
+        _log(f"⚠️  {tag}Skipped {total_skipped} of {total} ({'; '.join(parts)})")
         if "_last_error" in skips:
             _log(f"   sample error: {skips['_last_error']}")
 
-    # --- 4. Rank BUY signals -------------------------------------------
-    buys = [r for r in rows if r["signal"] == "BUY"]
-    buys.sort(key=lambda r: r.get("sort_value", 0.0), reverse=True)
+    # --- 4. Build one results dict per strategy ---------------------------
     top_n = cfg["top_n_display"]
-    top_buys = buys[:top_n]
-
-    results = {
-        "scan_id": scan_id,
-        "scan_time": scan_time,
-        "strategy": strategy_obj.name,
-        "strategy_key": strategy_obj.key,
-        "universe": universe,
-        "universe_size": len(raw_tickers),
-        "filtered_size": len(universe_list),
-        "scanned": len(rows),
-        "skipped": {k: v for k, v in skips.items() if not k.startswith("_")},
-        "buy_count": len(buys),
-        "hold_count": sum(1 for r in rows if r["signal"] == "HOLD"),
-        "sell_count": sum(1 for r in rows if r["signal"] == "SELL"),
-        "buy_signals": buys,
-        "top_buys": top_buys,
-        "all_results": rows,
-    }
+    all_results: List[Dict[str, Any]] = []
+    for i, (strat, sid, stime) in enumerate(specs):
+        rows = rows_by[i]
+        buys = [r for r in rows if r["signal"] == "BUY"]
+        buys.sort(key=lambda r: r.get("sort_value", 0.0), reverse=True)
+        all_results.append({
+            "scan_id": sid,
+            "scan_time": stime,
+            "strategy": strat.name,
+            "strategy_key": strat.key,
+            "timeframe": strat.timeframe,
+            "universe": universe,
+            "universe_size": len(raw_tickers),
+            "filtered_size": len(universe_list),
+            "scanned": len(rows),
+            "skipped": {
+                k: v for k, v in skips_by[i].items() if not k.startswith("_")
+            },
+            "buy_count": len(buys),
+            "hold_count": sum(1 for r in rows if r["signal"] == "HOLD"),
+            "sell_count": sum(1 for r in rows if r["signal"] == "SELL"),
+            "buy_signals": buys,
+            "top_buys": buys[:top_n],
+            "all_results": rows,
+        })
 
     # --- 5. Persist + alert --------------------------------------------
     try:
         init_db()
-        save_scan_results(results, strategy_obj.name)
+        for res in all_results:
+            save_scan_results(res, res["strategy"])
     except Exception as e:
         _log(f"⚠️  DB save skipped: {e}")
 
     if send_alert:
         try:
-            _send_telegram(results, top_n)
+            _send_telegram(all_results if multi else all_results[0], top_n)
         except Exception as e:
             _log(f"⚠️  Telegram skipped: {e}")
 
-    _print_summary(results)
-    return results
+    for res in all_results:
+        _print_summary(res)
+
+    if not multi:
+        return all_results[0]
+
+    return {
+        "multi": True,
+        "scans": all_results,
+        "scan_time": scan_time,
+        "scan_id": all_results[0]["scan_id"],
+        "strategy_names": [r["strategy"] for r in all_results],
+        # Aggregates for the dashboard headline row (per-tab detail in scans)
+        "scanned": max(r["scanned"] for r in all_results),
+        "buy_count": sum(r["buy_count"] for r in all_results),
+        "sell_count": sum(r["sell_count"] for r in all_results),
+        "hold_count": sum(r["hold_count"] for r in all_results),
+    }
 
 
 def _print_summary(results: Dict[str, Any]) -> None:
@@ -393,22 +494,49 @@ def _print_summary(results: Dict[str, Any]) -> None:
     _log("=" * 60 + "\n")
 
 
-def _send_telegram(results: Dict[str, Any], top_n: int) -> None:
-    msg = f"📊 *{results['strategy'].upper()} SCAN*\n"
-    msg += f"🗓 `{results['scan_time'].strftime('%Y-%m-%d %H:%M')}`\n"
-    msg += f"Scanned {results['scanned']} | BUY: *{results['buy_count']}*\n"
-    msg += "──────────────────────\n"
+def _send_telegram(results, top_n: int) -> None:
+    """Send one alert. Accepts a single results dict or a list of them
+    (multi-strategy bench runs send one combined digest)."""
+    if isinstance(results, dict):
+        results = [results]
 
-    if results["top_buys"]:
-        msg += f"🚀 *TOP {len(results['top_buys'])} BUY SETUPS:*\n\n"
-        for s in results["top_buys"]:
+    if len(results) == 1:
+        r = results[0]
+        msg = f"📊 *{r['strategy'].upper()} SCAN*\n"
+        msg += f"🗓 `{r['scan_time'].strftime('%Y-%m-%d %H:%M')}`\n"
+        msg += f"Scanned {r['scanned']} | BUY: *{r['buy_count']}*\n"
+        msg += "──────────────────────\n"
+
+        if r["top_buys"]:
+            msg += f"🚀 *TOP {len(r['top_buys'])} BUY SETUPS:*\n\n"
+            for s in r["top_buys"]:
+                msg += (f"• *{s['ticker']}* ₹{s['current_price']} "
+                        f"(`{s['weekly_change_pct']:+.2f}%`)\n"
+                        f"  {s['key_metrics']}\n"
+                        f"  hist: {s['hist_signal_count']} sig | "
+                        f"{s['hist_avg_return']:+.2f}%\n\n")
+        else:
+            msg += "⚪ *No BUY signals detected.*\n"
+
+        send_telegram_alert(msg)
+        return
+
+    # --- Multi-strategy digest: one section per strategy -----------------
+    total_buys = sum(r["buy_count"] for r in results)
+    msg = "📊 *MULTI-STRATEGY SCAN*\n"
+    msg += f"🗓 `{results[0]['scan_time'].strftime('%Y-%m-%d %H:%M')}`\n"
+    msg += (f"Scanned {max(r['scanned'] for r in results)} | "
+            f"BUY total: *{total_buys}*\n")
+    msg += "──────────────────────\n"
+    for r in results:
+        msg += f"\n🔥 *{r['strategy']}* — BUY: {r['buy_count']}\n"
+        if not r["top_buys"]:
+            msg += "⚪ none\n"
+            continue
+        for s in r["top_buys"][:5]:  # keep the digest readable
             msg += (f"• *{s['ticker']}* ₹{s['current_price']} "
                     f"(`{s['weekly_change_pct']:+.2f}%`)\n"
-                    f"  {s['key_metrics']}\n"
-                    f"  hist: {s['hist_signal_count']} sig | "
-                    f"{s['hist_avg_return']:+.2f}%\n\n")
-    else:
-        msg += "⚪ *No BUY signals detected.*\n"
+                    f"  {s['key_metrics']}\n")
 
     send_telegram_alert(msg)
 
@@ -480,7 +608,8 @@ def main() -> None:
     parser.add_argument(
         "-s", "--strategy",
         default=None,
-        help=f"Strategy key: {', '.join(list_strategies().keys())}",
+        help="Strategy key(s), comma-separated for a bench run "
+             f"(available: {', '.join(list_strategies().keys())})",
     )
     parser.add_argument(
         "-u", "--universe",

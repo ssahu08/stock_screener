@@ -7,9 +7,29 @@ can be added without touching the engine.
 
 ## Current strategies
 
-| Key | Name | Status |
-|-----|------|--------|
-| `hilega_milega` | Hilega Milega (RSI-9 momentum) | ✅ Implemented & verified |
+| Key | Name | Bars | Role |
+|-----|------|------|------|
+| `hilega_milega` | Hilega Milega (RSI-9 momentum) | weekly | trend-momentum (in 2-week live trial) |
+| `volcano_watch` | Volcano Watch | daily | **advance watchlist** — squeeze forming BEFORE the breakout (fast BB(10) windows) |
+| `volcano_blast` | Volcano Blast | daily | breakout trigger — squeeze → close > upper band + 1.5× volume |
+| `volcano_snap` | Volcano Snap | daily | fast trigger — BB(10) squeeze + 1.2× volume, sized for 4–6-session coils |
+| `coil_break` | Coil Break | daily | Bollinger-inside-Keltner squeeze → same expansion trigger |
+| `darvas_box` | Darvas Box | daily | flat 20-bar box → close above the box high |
+| `volcano_blast_60` | Volcano Blast 60 | 60 min | Blast rules on hourly bars (Fyers caps intraday history at 100 days) |
+
+### The squeeze test bench
+
+The family from `volcano_watch` down is a **test bench** reverse-engineered
+from your own chart screenshots (`dataset/*.JPG`): Bollinger compression
+("squeeze") → expansion-candle breakout. Every variant shares ONE exit
+rule (close falls below the band mid after a recent squeeze) so that
+ENTRY rules stay directly comparable while you review which category
+fits your style. They can be scanned together — data is fetched once
+per stock and shared:
+
+```bash
+python engine.py -s volcano_watch,volcano_blast,volcano_snap -u nifty50
+```
 
 ## Architecture
 
@@ -25,7 +45,8 @@ stock_screener/
 ├── strategies/
 │   ├── base.py              # Strategy ABC — subclass to add a strategy
 │   ├── registry.py          # Register strategies here (appears in menu/UI)
-│   └── hilega_milega.py     # Hilega Milega implementation
+│   ├── hilega_milega.py     # Hilega Milega implementation
+│   └── volcano.py           # Squeeze family: Watch/Blast/Snap/Coil/Darvas/60
 ├── storage/
 │   └── db.py                # DuckDB persistence + schema migration
 ├── engine.py                # Scan orchestration (CLI + library)
@@ -52,6 +73,7 @@ python engine.py                                  # interactive menu
 python engine.py -s hilega_milega -u nifty50      # quick sample
 python engine.py -s hilega_milega                 # full NSE scan
 python engine.py -s hilega_milega --no-alert      # skip Telegram
+python engine.py -s hilega_milega,volcano_watch,volcano_snap  # bench run
 ```
 
 Tokens expire daily (~6:30 AM IST). Re-run `python core/auth.py`
