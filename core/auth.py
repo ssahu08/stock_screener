@@ -201,9 +201,8 @@ if __name__ == "__main__":
         print("✅ Authentication Complete!")
         print("=" * 60)
         print("\nYou can now run the screener:")
-        print("   python engine.py")
-        print("   OR")
-        print("   python test_hilega_milega.py")
+        print("   streamlit run app.py       (dashboard)")
+        print("   python engine.py           (terminal scan)")
     else:
         print("\n" + "=" * 60)
         print("❌ Authentication Failed")
