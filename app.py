@@ -201,7 +201,10 @@ run_clicked = st.sidebar.button(
 # ------------------------------------------------------------------
 
 st.title("NSE Stock Screener")
-_tfs = sorted({get_strategy(k)["timeframe"] for k in strategy_keys})
+# .get() fallback: a long-running Streamlit process can hold a stale
+# registry entry from before an edit (KeyError: 'timeframe' seen live).
+_tfs = sorted({(get_strategy(k) or {}).get("timeframe", "weekly")
+               for k in strategy_keys})
 st.caption(
     f"Strategies: **{', '.join(strategies[k] for k in strategy_keys)}** · "
     f"timeframe: {', '.join(_tfs)} · "
