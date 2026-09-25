@@ -71,6 +71,15 @@ if not st.session_state.get("unlocked"):
 from config.settings import UNIVERSE_SETTINGS
 from core.auth import read_valid_token, build_auth_url, exchange_auth_code
 from engine import run_screener, get_fyers_client
+
+# Scheduled Telegram jobs: SOD 09:00 IST (US close + NIFTY + expiry reminder)
+# and EOD 15:45 IST (NIFTY summary).  Idempotent — one thread per process.
+# Disable with SCREENER_SCHEDULER_DISABLE=1 (tests).
+try:
+    from core.scheduler import start_scheduler
+    start_scheduler()
+except Exception as _sched_exc:
+    st.sidebar.warning(f"Scheduler not running: {_sched_exc}")
 from storage.db import get_scan_history, get_strategy_stats
 from strategies.registry import list_strategies
 

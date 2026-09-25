@@ -64,6 +64,12 @@ external monitor that opens your app URL every ~10 minutes:
 Opening the URL also wakes a sleeping app within seconds, so even without
 the monitor you only lose convenience — not data.
 
+While the app is awake, the built-in scheduler (`core/scheduler.py`) sends:
+**09:00 IST** — US close + signals, NIFTY previous session open/close, and a
+**one-day-prior expiry reminder** (NIFTY/BANKNIFTY); **15:45 IST** — NIFTY
+open/high/low/close summary. State lives in `data/scheduler_state.json`
+(resets on redeploy — at most one duplicate per job after a redeploy).
+
 ## 4. Updating the app (your laptop → phone workflow)
 
 ```bash

@@ -142,7 +142,10 @@ It now appears in the CLI menu and the Streamlit sidebar automatically.
 - **Price filter:** ₹50–₹2,000 (configurable in sidebar / settings.py)
 - **Storage:** DuckDB (`data/screener.duckdb`), keeps the 2 most recent
   scans per strategy; older scans are pruned automatically
-- **Alerts:** Telegram summary of top BUY setups (configured in `.streamlit/secrets.toml`)
+- **Alerts:** Telegram summary of top BUY setups (configured in `.streamlit/secrets.toml`),
+  plus scheduled messages from `core/scheduler.py`: SOD at 09:00 IST (US close
+  + signals + NIFTY prev session + day-before-expiry reminder) and EOD at
+  15:45 IST (NIFTY open/close summary)
 
 ## Security notes
 
