@@ -13,6 +13,7 @@ from strategies.volcano import (
     VolcanoBlast60,
     VolcanoSnap,
 )
+from strategies.ipo_listing import IPOListingGains
 
 # Auto-register all subclasses of Strategy discovered in the strategies/ folder
 # This makes adding new strategies as simple as creating a new file.
@@ -62,6 +63,11 @@ class _BuiltInVolcanoBlast60(VolcanoBlast60):
 
 @register_strategy
 class _BuiltInVolcanoSnap(VolcanoSnap):
+    pass
+
+# --- IPO Listing Gains ------------------------------------------------------
+@register_strategy
+class _BuiltInIPOListingGains(IPOListingGains):
     pass
 
 # At module load time, populate registry
