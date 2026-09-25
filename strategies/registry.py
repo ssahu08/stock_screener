@@ -15,6 +15,7 @@ from strategies.volcano import (
 )
 from strategies.ipo_listing import IPOListingGains
 from strategies.expiry_credit_spread import ExpiryCreditSpread, SpreadConfig
+from strategies.global_macro.index_follower import IndexFollower
 
 # Auto-register all subclasses of Strategy discovered in the strategies/ folder
 # This makes adding new strategies as simple as creating a new file.
@@ -81,6 +82,11 @@ class _BuiltInExpiryCreditSpreadNifty(ExpiryCreditSpread):
 class _BuiltInExpiryCreditSpreadBankNifty(ExpiryCreditSpread):
     def __init__(self):
         super().__init__(SpreadConfig(index="BANKNIFTY", lot_size=15))
+
+# --- Global Macro -----------------------------------------------------------
+@register_strategy
+class _BuiltInIndexFollower(IndexFollower):
+    pass
 
 # At module load time, populate registry
 # (The @register_strategy decorator already added above)
