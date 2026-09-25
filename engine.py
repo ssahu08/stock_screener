@@ -38,6 +38,13 @@ import pandas as pd
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 
+# Windows consoles default to cp1252 — emoji in logs would crash scans.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 warnings.filterwarnings("ignore")
 
 from config.settings import UNIVERSE_SETTINGS
@@ -65,7 +72,12 @@ _print_lock = threading.Lock()
 
 def _log(msg: str) -> None:
     with _print_lock:
-        print(msg, flush=True)
+        try:
+            print(msg, flush=True)
+        except UnicodeEncodeError:
+            # Console may be cp1252 (Windows) — never let logging kill a scan
+            enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+            print(msg.encode(enc, errors="replace").decode(enc), flush=True)
 
 
 # ------------------------------------------------------------------

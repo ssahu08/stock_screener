@@ -1,29 +1,29 @@
 """
-Streamlit Dashboard — control panel for the screener
-=====================================================
+Streamlit Dashboard — NSE Stock Screener
+==========================================
 
-Run it:
-    streamlit run app.py
+Two kinds of categories:
+  SCAN   — runs the NSE scan engine (Long Term, Breakout/BTST, Intraday)
+  PANEL  — standalone panels, NEVER scan NSE (Global Macro, Event-Driven)
 
-What you can do here (no terminal commands needed):
-    - Click "Run Scan" to execute a full market scan
-    - Pick strategies / universe / price range in the sidebar
-    - View BUY signals, download CSV, browse scan history
-    - See strategy performance stats
-
-Login (Option A) still happens ONCE in your terminal:
-    python core/auth.py
-The dashboard only checks whether today's token exists —
-it never asks for credentials or tokens.
+Run: streamlit run app.py
+Login (once/day in terminal): python core/auth.py
 """
 
 import os
 import sys
 
+# Windows consoles default to cp1252 — emoji in logs would crash scans.
+# UTF-8 output never raises UnicodeEncodeError.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 import pandas as pd
 import streamlit as st
 
-# Project root on path
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 
@@ -36,9 +36,53 @@ st.set_page_config(
 
 from config.settings import UNIVERSE_SETTINGS
 from core.auth import read_valid_token
-from engine import run_screener
+from engine import run_screener, get_fyers_client
 from storage.db import get_scan_history, get_strategy_stats
-from strategies.registry import get_strategy, list_strategies
+from strategies.registry import list_strategies
+
+
+# ------------------------------------------------------------------
+# Categories — kind = "scan" (NSE engine) or "panel" (standalone)
+# ------------------------------------------------------------------
+
+CATEGORIES = {
+    "long_term": {
+        "label": "📈 Long Term",
+        "kind": "scan",
+        "strategies": ["hilega_milega"],
+        "description": "Weekly momentum, trend following — 2-week live trial",
+    },
+    "breakout": {
+        "label": "🚀 Breakout / BTST",
+        "kind": "scan",
+        "strategies": [
+            "volcano_watch", "volcano_blast", "volcano_snap",
+            "coil_break", "darvas_box",
+        ],
+        "description": "Daily compression → expansion breakouts",
+    },
+    "intraday": {
+        "label": "⚡ Intraday",
+        "kind": "scan",
+        "strategies": [
+            "volcano_blast_60", "expiry_credit_spread_nifty",
+            "expiry_credit_spread_banknifty",
+        ],
+        "description": "Same-day entry/exit: 60-min volatility, expiry credit spreads",
+    },
+    "global_macro": {
+        "label": "🌍 Global Macro",
+        "kind": "panel",
+        "strategies": ["index_follower"],
+        "description": "US close ±1% → 4 Indian ETFs. No NSE scan — checks only MON100, MONQ50, MASPTOP50, MAFANG.",
+    },
+    "event_driven": {
+        "label": "📋 Event-Driven",
+        "kind": "panel",
+        "strategies": ["ipo_listing_gains"],
+        "description": "IPO listing gains tracker (Apify + NSE cross-check)",
+    },
+}
 
 
 # ------------------------------------------------------------------
@@ -46,14 +90,12 @@ from strategies.registry import get_strategy, list_strategies
 # ------------------------------------------------------------------
 
 def token_status() -> tuple[bool, str]:
-    """Check Option A token validity without prompting."""
     if read_valid_token():
         return True, "✅ Fyers token valid for today"
     return False, "🔐 No valid token — run `python core/auth.py` once"
 
 
 def buys_frame(rows: list[dict]) -> pd.DataFrame:
-    """BUY rows -> tidy DataFrame for display/download."""
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(rows)
@@ -70,17 +112,12 @@ def buys_frame(rows: list[dict]) -> pd.DataFrame:
 
 
 def _render_scan(res: dict) -> None:
-    """BUY table + CSV download + full-results expander for ONE scan."""
-    st.subheader(
-        f"🚀 BUY Signals — top {len(res['top_buys'])} of {res['buy_count']}"
-    )
+    """Render BUY table + CSV + all-results for ONE strategy scan."""
+    st.subheader(f"🚀 BUY Signals — top {len(res['top_buys'])} of {res['buy_count']}")
 
     buys = buys_frame(res["top_buys"])
     if buys.empty:
-        st.info(
-            "⚪ No BUY signals in this scan. Try a later run — "
-            "signals appear on bar closes."
-        )
+        st.info("⚪ No BUY signals in this scan. Signals appear on bar closes — try a later run.")
     else:
         st.dataframe(
             buys,
@@ -88,49 +125,27 @@ def _render_scan(res: dict) -> None:
             hide_index=True,
             column_config={
                 "ticker": st.column_config.TextColumn("Ticker", width="small"),
-                "current_price": st.column_config.NumberColumn(
-                    "Price", format="₹%.2f", width="small"
-                ),
-                "key_metrics": st.column_config.TextColumn(
-                    "Indicators", width="large"
-                ),
-                "weekly_change_pct": st.column_config.NumberColumn(
-                    "1W %", format="%+.2f%%", width="small"
-                ),
-                "hist_signal_count": st.column_config.NumberColumn(
-                    "Hist sigs", format="%d", width="small",
-                    help="Times this setup fired in the scanned history",
-                ),
-                "hist_avg_return": st.column_config.NumberColumn(
-                    "Avg 4W fwd", format="%+.2f%%", width="small",
-                    help="Average forward 4-week return after past signals",
-                ),
-                "hist_signal_dates": st.column_config.TextColumn(
-                    "Past signal dates", width="large"
-                ),
+                "current_price": st.column_config.NumberColumn("Price", format="₹%.2f", width="small"),
+                "key_metrics": st.column_config.TextColumn("Indicators", width="large"),
+                "weekly_change_pct": st.column_config.NumberColumn("1W %", format="%+.2f%%", width="small"),
+                "hist_signal_count": st.column_config.NumberColumn("Hist sigs", format="%d", width="small",
+                    help="Times this setup fired in scanned history"),
+                "hist_avg_return": st.column_config.NumberColumn("Avg 4W fwd", format="%+.2f%%", width="small",
+                    help="Average forward 4-week return after past signals"),
+                "hist_signal_dates": st.column_config.TextColumn("Past signal dates", width="large"),
                 "zone_breakout": st.column_config.CheckboxColumn("Zone break"),
                 "breakout_direction": st.column_config.TextColumn("Dir", width="tiny"),
-                "stop_loss_price": st.column_config.NumberColumn(
-                    "Stop (zone)", format="₹%.2f", width="small",
-                    help="Low (longs) / high (shorts) of the candle where the "
-                         "red line first broke out of the zone",
-                ),
-                "profit_taking_warning": st.column_config.CheckboxColumn(
-                    "EMA≈RSI warn",
-                    help="Green line touching RSI = early profit-taking warning",
-                ),
+                "stop_loss_price": st.column_config.NumberColumn("Stop (zone)", format="₹%.2f", width="small"),
+                "profit_taking_warning": st.column_config.CheckboxColumn("EMA≈RSI warn"),
             },
         )
-
-        csv = buys.to_csv(index=False).encode("utf-8")
         st.download_button(
             "📥 Download BUY signals (CSV)",
-            data=csv,
+            data=buys.to_csv(index=False).encode("utf-8"),
             file_name=f"buy_signals_{res['scan_id']}.csv",
             mime="text/csv",
         )
 
-    # Full scan table in an expander
     with st.expander(f"🗂 All {res['scanned']} evaluated stocks (incl. HOLD/SELL)"):
         all_df = pd.DataFrame(res["all_results"])
         show = [c for c in [
@@ -140,48 +155,179 @@ def _render_scan(res: dict) -> None:
         st.dataframe(all_df[show], width="stretch", hide_index=True)
 
 
-def _render_ipo_tab() -> None:
-    """Event-driven IPO tab: fetch from Apify, score, display table with freshness & cross-check."""
-    from strategies.ipo_listing import IPOListingGains, VerifiedListingsCache
-    from config.keys import APIFY_TOKEN
+def render_scan_category(cat_key: str) -> None:
+    """Show stored scan results filtered to this category's strategies."""
+    info = CATEGORIES[cat_key]
+    st.caption(info["description"])
 
-    st.subheader("📋 IPO Listing Gains — Live Tracker")
+    res = st.session_state.get("scan_result")
+    if res is None:
+        st.info("👈 Click **Run Scan** in the sidebar to scan this category.")
+        return
+    if res.get("error"):
+        st.warning(res.get("message", "Scan failed."))
+        return
+
+    scans = res["scans"] if res.get("multi") else [res]
+    mine = [s for s in scans if s.get("strategy_key") in info["strategies"]]
+    if not mine:
+        st.info("The last scan didn't include this category. Click **Run Scan** again.")
+        return
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Scanned", max(s["scanned"] for s in mine))
+    m2.metric("BUY", sum(s["buy_count"] for s in mine))
+    m3.metric("SELL", sum(s["sell_count"] for s in mine))
+    m4.metric("HOLD", sum(s["hold_count"] for s in mine))
+    m5.metric("Scan Time", res.get("scan_time", mine[0]["scan_time"]).strftime("%H:%M:%S"))
+
+    if len(mine) == 1:
+        _render_scan(mine[0])
+    else:
+        tabs = st.tabs([f"🔥 {s['strategy']}" for s in mine])
+        for tab, s in zip(tabs, mine):
+            with tab:
+                _render_scan(s)
+
+
+# ------------------------------------------------------------------
+# Global Macro panel — ETFs ONLY, never touches NSE scan engine
+# ------------------------------------------------------------------
+
+def render_global_macro() -> None:
+    from strategies.global_macro.index_follower import IndexFollower
+    from strategies.global_macro.config import ETF_UNIVERSE, CAPITAL_PER_TRADE
+
+    st.caption(CATEGORIES["global_macro"]["description"])
+
+    idx = IndexFollower()
+
+    # --- 1. US close + signals -------------------------------------
+    if st.button("🔄 Fetch US Close & Signals", type="primary", width="stretch"):
+        with st.spinner("Fetching US indices…"):
+            st.session_state["gm_plan"] = idx.get_sod_plan()
+
+    plan = st.session_state.get("gm_plan")
+    if plan:
+        st.markdown("#### 📊 US Indices (previous close)")
+        cols = st.columns(4)
+        for i, (name, pct) in enumerate(plan["us_indices"].items()):
+            with cols[i % 4]:
+                delta = f"{pct:+.2f}%" if pct is not None else "N/A"
+                st.metric(name, delta, delta_color="normal")
+
+        if plan["signals"]:
+            st.markdown("#### 🎯 Trade Signals (buy at 9:15 AM open)")
+            for s in plan["signals"]:
+                st.write(
+                    f"**{s['direction']} {s['etf_symbol']}** — {s['trigger']} "
+                    f"| ₹{s['capital']:,} capital"
+                )
+        else:
+            st.info("📭 No signals — no US index moved ±1% or more.")
+
+        if plan["major_alerts"]:
+            for a in plan["major_alerts"]:
+                st.warning(a["message"])
+    else:
+        st.caption("Click the button above to fetch yesterday's US close and today's ETF signals.")
+
+    # --- 2. Live ETF quotes (4 symbols only) ------------------------
+    st.markdown("#### 📡 ETF Quotes (NSE — 4 symbols only)")
+    fyers = get_fyers_client()
+    if fyers is None:
+        st.warning("No Fyers token — run `python core/auth.py` to see live ETF prices.")
+    else:
+        try:
+            symbols = ",".join(f"NSE:{e.symbol}-EQ" for e in ETF_UNIVERSE)
+            resp = fyers.quotes({"symbols": symbols})
+            if resp.get("s") == "ok":
+                qdf = pd.DataFrame([
+                    {
+                        "ETF": d["n"].split(":")[-1].replace("-EQ", ""),
+                        "LTP ₹": d["v"].get("lp"),
+                        "Change %": (
+                            round((d["v"]["lp"] - d["v"]["ep"]) / d["v"]["ep"] * 100, 2)
+                            if d["v"].get("ep") else None
+                        ),
+                        "High ₹": d["v"].get("ht"),
+                        "Low ₹": d["v"].get("lt"),
+                    }
+                    for d in resp["d"]
+                ])
+                st.dataframe(qdf, width="stretch", hide_index=True)
+            else:
+                st.info("Quotes unavailable right now.")
+        except Exception as e:
+            st.info(f"Quote fetch failed: {e}")
+
+    # --- 3. Manual trade log ---------------------------------------
+    st.divider()
+    st.markdown("#### 📝 Trade Log (₹10,000 per trade, exit by discretion)")
+    t1, t2, t3, t4, t5 = st.columns([2, 1, 1, 1, 1])
+    with t1:
+        etf = st.selectbox("ETF", [e.symbol for e in ETF_UNIVERSE], key="gm_etf")
+    with t2:
+        direction = st.selectbox("Dir", ["BUY", "SELL"], key="gm_dir")
+    with t3:
+        entry = st.number_input("Entry ₹", min_value=0.0, step=0.01, key="gm_entry")
+    with t4:
+        exit_price = st.number_input("Exit ₹", min_value=0.0, step=0.01, key="gm_exit")
+    with t5:
+        st.caption("")  # align
+        if st.button("💾 Log", key="gm_log", width="stretch") and entry > 0:
+            units = CAPITAL_PER_TRADE / entry
+            pnl = (exit_price - entry) * units
+            st.session_state.setdefault("gm_trades", []).append({
+                "etf": etf, "dir": direction, "entry": entry,
+                "exit": exit_price, "pnl": round(pnl),
+            })
+            st.rerun()
+
+    trades = st.session_state.get("gm_trades", [])
+    if trades:
+        tdf = pd.DataFrame(trades)
+        st.dataframe(tdf, width="stretch", hide_index=True)
+        st.metric("Total P&L", f"₹{tdf['pnl'].sum():+,.0f}")
+        if st.button("🗑️ Clear log", key="gm_clear"):
+            st.session_state["gm_trades"] = []
+            st.rerun()
+
+
+# ------------------------------------------------------------------
+# Event-Driven panel (IPO)
+# ------------------------------------------------------------------
+
+def render_event_driven() -> None:
+    from config.keys import APIFY_TOKEN
+    from strategies.ipo_listing import IPOListingGains, VerifiedListingsCache
+
+    st.caption(CATEGORIES["event_driven"]["description"])
 
     if not APIFY_TOKEN:
-        st.warning(
-            "**Apify token not configured.**\n\n"
-            "1. Get your free token from https://console.apify.com/account/integrations\n"
-            "2. Add it to `config/keys.py` as `APIFY_TOKEN = \"your_token\"`\n"
-            "3. Restart the dashboard."
-        )
+        st.warning("⚠️ Apify token not configured. Add to `config/keys.py` and restart.")
         return
 
     ipo_strat = IPOListingGains()
 
-    # --- Controls ---
     col1, col2, col3, col4 = st.columns([1, 1, 1, 2])
     with col1:
         view = st.selectbox(
-            "View",
-            options=["live_upcoming_listed", "live_upcoming"],
-            format_func=lambda v: "All (live + upcoming + listed)" if v == "live_upcoming_listed" else "Live + upcoming only",
-            index=0,
+            "View", ["live_upcoming_listed", "live_upcoming"],
+            format_func=lambda v: "All (live+upcoming+listed)" if v == "live_upcoming_listed" else "Live+Upcoming",
         )
     with col2:
         category = st.selectbox(
-            "Category",
-            options=["all", "mainboard", "sme"],
+            "Category", ["all", "mainboard", "sme"],
             format_func=lambda c: c.capitalize() if c != "all" else "All",
-            index=0,
         )
     with col3:
         refresh = st.button("🔄 Refresh IPO Data", type="primary", width="stretch")
     with col4:
-        st.caption("⚠️ **Apify data lags ~2–4 weeks for listed IPOs.** Verify on NSE/BSE before applying.")
+        st.caption("⚠️ Apify data lags 2–4 weeks for listed IPOs. Verify on NSE/BSE.")
 
-    # --- Fetch ---
     if "ipo_data" not in st.session_state or refresh:
-        with st.spinner("Fetching IPOs from Apify, scoring & cross-checking NSE…"):
+        with st.spinner("Fetching IPOs from Apify, scoring & NSE cross-check…"):
             try:
                 cat = None if category == "all" else category
                 result = ipo_strat.fetch_and_score(view=view, category=cat)
@@ -191,116 +337,79 @@ def _render_ipo_tab() -> None:
             except Exception as e:
                 st.error(f"Failed to fetch IPO data: {e}")
                 st.session_state["ipo_data"] = []
-                st.session_state["ipo_meta"] = {}
 
     ipo_list = st.session_state.get("ipo_data", [])
     meta = st.session_state.get("ipo_meta", {})
 
     if not ipo_list:
-        st.info("No IPO data yet — click **Refresh IPO Data**.")
+        st.info("No IPO data — click **Refresh IPO Data**.")
         return
 
-    # --- Freshness / Meta Banner ---
     freshness = meta.get("apify_freshness_utc")
     fetched_at = st.session_state.get("ipo_fetched_at", "—")
-    verified_count = meta.get("verified_count", 0)
-    nse_active_count = meta.get("nse_active_count", 0)
 
     fb1, fb2, fb3, fb4, fb5 = st.columns(5)
     fb1.metric("Total IPOs", meta.get("total", len(ipo_list)))
-    fb2.metric("User-verified ✅", verified_count)
-    fb3.metric("NSE active cross-check", nse_active_count)
-    fb4.caption(f"Apify data as of: {freshness[:16].replace('T', ' ') if freshness else '—'} UTC")
-    fb5.caption(f"Dashboard refreshed: {fetched_at}")
+    fb2.metric("User-verified ✅", meta.get("verified_count", 0))
+    fb3.metric("NSE active cross-check", meta.get("nse_active_count", 0))
+    fb4.caption(f"Apify data: {freshness[:16].replace('T', ' ') if freshness else '—'} UTC")
+    fb5.caption(f"Refreshed: {fetched_at}")
 
-    # --- Summary metrics ---
     listed = [i for i in ipo_list if i["status"] == "LISTED"]
     upcoming = [i for i in ipo_list if i["status"] in ("SUBSCRIPTION_OPEN", "ALLOTMENT_DONE")]
     drhp = [i for i in ipo_list if i["status"] == "DRHP_FILED"]
     verified = [i for i in ipo_list if i.get("verified_source")]
 
     m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("User-verified Listed ✅", len(verified))
-    m2.metric("Apify LISTED (may lag)", len([i for i in ipo_list if i["status"] == "LISTED"]))
-    m3.metric("Subscription open", len(upcoming))
-    m4.metric("DRHP filed", len(drhp))
+    m1.metric("Verified Listed ✅", len(verified))
+    m2.metric("Apify LISTED (lag)", len(listed))
+    m3.metric("Sub Open", len(upcoming))
+    m4.metric("DRHP", len(drhp))
     if listed:
-        avg_gain = sum(i["listing_gain_pct"] or 0 for i in listed if i.get("listing_gain_pct")) / max(1, len([i for i in listed if i.get("listing_gain_pct")]))
-        m5.metric("Avg gain (tracked)", f"{avg_gain:+.1f}%")
+        gains = [i["listing_gain_pct"] for i in listed if i.get("listing_gain_pct") is not None]
+        m5.metric("Avg Gain", f"{sum(gains) / len(gains):+.1f}%" if gains else "—")
     else:
-        m5.metric("Avg gain", "—")
+        m5.metric("Avg Gain", "—")
 
     st.divider()
 
-    # --- NSE Active IPOs Cross-Check Section ---
     with st.expander("🔍 NSE Active IPOs (Official Cross-Check)", expanded=False):
-        nse_client = IPOListingGains().get_nse_active_ipos()
+        nse_client = ipo_strat.get_nse_active_ipos()
         if nse_client:
             nse_df = pd.DataFrame(nse_client)
             st.dataframe(
-                nse_df[[c for c in ["company", "symbol", "series", "issue_price", "start_date", "end_date", "status"] if c in nse_df.columns]],
+                nse_df[[c for c in ["company", "symbol", "series", "issue_price",
+                                    "start_date", "end_date", "status"] if c in nse_df.columns]],
                 width="stretch", hide_index=True,
-                column_config={
-                    "company": st.column_config.TextColumn("Company", width="large"),
-                    "symbol": st.column_config.TextColumn("Symbol", width="small"),
-                    "series": st.column_config.TextColumn("Series", width="small"),
-                    "issue_price": st.column_config.TextColumn("Issue Price", width="small"),
-                    "start_date": st.column_config.TextColumn("Open", width="small"),
-                    "end_date": st.column_config.TextColumn("Close", width="small"),
-                    "status": st.column_config.TextColumn("Status", width="small"),
-                },
             )
-            st.caption(f"Source: NSE India Official API · {len(nse_client)} active IPOs")
         else:
-            st.info("No active IPOs on NSE currently, or API unavailable.")
+            st.info("No active IPOs on NSE or API unavailable.")
 
     st.divider()
 
-    # --- Main IPO Table ---
     df = pd.DataFrame(ipo_list)
-
-    # Add NSE cross-check columns
     df["nse_match"] = df.apply(
         lambda r: "✅ Active on NSE" if r.get("nse_active_status") == "Active"
         else ("⚠️ NSE: " + str(r.get("nse_active_status")) if r.get("nse_active_status") else "—"),
-        axis=1
+        axis=1,
     )
 
-    # Reorder columns: decision-critical first
     display_cols = [
-        "company",              # What stock
-        "status",               # Where in lifecycle
-        "recommendation",       # STRONG_APPLY / APPLY / TRACK / AVOID
-        "score",                # 0-100 composite
-        "expected_gain_low_pct", "expected_gain_high_pct",  # Expected gain range
-        "gmp_pct", "gmp",       # Grey market premium (key predictor)
-        "issue_price",          # Entry price
-        "subscription_x",       # Overall demand
-        "qib_x",                # Smart money demand
-        "issue_size_cr",        # Smaller = more pop potential
-        "category",             # mainboard vs sme
-        "nse_match",            # NSE cross-check
-        "verified_source",      # User-verified badge
-        "sub_open", "sub_close", # Subscription window
-        "listing_date", "days_to_listing",  # Timeline
-        "breakdown",            # Score component breakdown (technical)
+        "company", "status", "recommendation", "score",
+        "expected_gain_low_pct", "expected_gain_high_pct",
+        "gmp_pct", "gmp", "issue_price", "subscription_x", "qib_x", "issue_size_cr",
+        "category", "nse_match", "verified_source",
+        "sub_open", "sub_close", "listing_date", "days_to_listing", "breakdown",
     ]
     df = df[[c for c in display_cols if c in df.columns]]
 
-    # Color-code recommendation
     def rec_color(val):
-        colors = {
-            "STRONG_APPLY": "background-color: #d4edda; color: #155724",
-            "APPLY": "background-color: #d4edda; color: #155724",
-            "TRACK": "background-color: #fff3cd; color: #856404",
-            "AVOID": "background-color: #f8d7da; color: #721c24",
-        }
-        return colors.get(val, "")
+        colors = {"STRONG_APPLY": "#d4edda", "APPLY": "#d4edda",
+                  "TRACK": "#fff3cd", "AVOID": "#f8d7da"}
+        return f"background-color: {colors[val]}; color: #155724" if val in colors else ""
 
     def verified_color(val):
-        if val and val != "—":
-            return "background-color: #d4edda; color: #155724; font-weight: bold"
-        return ""
+        return "background-color: #d4edda; color: #155724; font-weight: bold" if val and val != "—" else ""
 
     def nse_color(val):
         if "✅" in str(val):
@@ -313,8 +422,7 @@ def _render_ipo_tab() -> None:
         df.style.map(rec_color, subset=["recommendation"])
                .map(verified_color, subset=["verified_source"])
                .map(nse_color, subset=["nse_match"]),
-        width="stretch",
-        hide_index=True,
+        width="stretch", hide_index=True,
         column_config={
             "company": st.column_config.TextColumn("Company", width="large"),
             "status": st.column_config.TextColumn("Status", width="medium"),
@@ -339,75 +447,80 @@ def _render_ipo_tab() -> None:
         },
     )
 
-    # --- Mark as Listed (User Verification) ---
     st.divider()
-    st.subheader("✅ Mark IPO as Listed (User Verification)")
-    st.caption("If you confirm an IPO has listed (check NSE/BSE), add it here to override Apify's stale status.")
+    st.markdown("#### ✅ Mark IPO as Listed (User Verification)")
+    unverified = [i for i in ipo_list if not i.get("verified_source")]
+    if unverified:
+        v1, v2, v3, v4, v5 = st.columns([2, 1, 1, 1, 1])
+        with v1:
+            label = st.selectbox(
+                "Select IPO",
+                [f"{i['company']} ({i['ipo_id']})" for i in unverified],
+                key="ipo_verify",
+            )
+            selected_id = next(i["ipo_id"] for i in unverified
+                               if f"{i['company']} ({i['ipo_id']})" == label)
+        with v2:
+            list_date = st.date_input("Listing date", key="ipo_ldate")
+        with v3:
+            list_price = st.number_input("Listing price (₹)", min_value=0.0, step=0.01, format="%.2f", key="ipo_lprice")
+        with v4:
+            gain_pct = st.number_input("Gain %", step=0.1, format="%.1f", key="ipo_gain")
+        with v5:
+            st.caption("")
+            if st.button("✅ Save", type="primary", key="ipo_save", width="stretch"):
+                cache = VerifiedListingsCache()
+                cache.set(selected_id, {
+                    "listing_date": list_date.isoformat(),
+                    "listing_price": list_price,
+                    "listing_gain_pct": gain_pct,
+                })
+                st.success("Saved! Refresh to see updated status.")
+                st.rerun()
+    else:
+        st.info("All IPOs already verified or none available.")
 
-    v1, v2, v3, v4, v5 = st.columns([2, 1, 1, 1, 1])
-    with v1:
-        # Only show IPOs not yet verified
-        unverified = [i for i in ipo_list if not i.get("verified_source")]
-        verify_options = {f"{i['company']} ({i['ipo_id']})": i['ipo_id'] for i in unverified}
-        if verify_options:
-            selected = st.selectbox("Select IPO to mark as listed", options=list(verify_options.keys()))
-            selected_id = verify_options[selected]
-        else:
-            selected_id = None
-            st.info("All IPOs already verified or none available.")
-
-    with v2:
-        list_date = st.date_input("Listing date")
-    with v3:
-        list_price = st.number_input("Listing price (₹)", min_value=0.0, step=0.01, format="%.2f")
-    with v4:
-        gain_pct = st.number_input("Gain %", step=0.1, format="%.1f")
-    with v5:
-        if selected_id and st.button("✅ Save Verification", type="primary"):
-            ipo_strat.verify_listing(selected_id, list_date.isoformat(), list_price, gain_pct)
-            st.success(f"Saved! Refresh to see updated status.")
-            st.rerun()
-
-    # Show current verified list
     verified_list = [i for i in ipo_list if i.get("verified_source")]
     if verified_list:
         with st.expander("📋 User-Verified Listings", expanded=False):
             vdf = pd.DataFrame(verified_list)
-            vcols = ["company", "listing_date", "listing_price", "listing_gain_pct", "verified_source"]
-            st.dataframe(vdf[[c for c in vcols if c in vdf.columns]], width="stretch", hide_index=True)
-            if st.button("🗑️ Clear All Verifications"):
+            st.dataframe(
+                vdf[["company", "listing_date", "listing_price",
+                     "listing_gain_pct", "verified_source"]],
+                width="stretch", hide_index=True,
+            )
+            if st.button("🗑️ Clear All Verifications", key="ipo_clear"):
                 cache = VerifiedListingsCache()
                 for v in verified_list:
                     cache.remove(v["ipo_id"])
-                st.success("Cleared. Refresh to reload.")
                 st.rerun()
 
-    # Download
-    csv = df.to_csv(index=False).encode("utf-8")
     st.download_button(
         "📥 Download IPO Tracker (CSV)",
-        data=csv,
+        data=df.to_csv(index=False).encode("utf-8"),
         file_name=f"ipo_tracker_{pd.Timestamp.now().strftime('%Y%m%d_%H%M')}.csv",
         mime="text/csv",
     )
 
-    # Listing performance section
     if listed:
         st.divider()
-        st.subheader("📊 Recently Listed — Actual Gains (from Apify)")
+        st.subheader("📊 Recently Listed — Actual Gains")
         perf_df = pd.DataFrame(listed)
-        perf_cols = ["company", "issue_price", "listing_price", "listing_gain_pct", "listing_date", "gmp_at_listing"]
-        perf_df = perf_df[[c for c in perf_cols if c in perf_df.columns]]
+        perf_cols = ["company", "issue_price", "listing_price",
+                     "listing_gain_pct", "listing_date", "gmp_at_listing"]
         st.dataframe(
-            perf_df.style.map(lambda v: "color: green" if isinstance(v, (int, float)) and v > 0 else ("color: red" if isinstance(v, (int, float)) and v < 0 else ""), subset=["listing_gain_pct"]),
-            width="stretch",
-            hide_index=True,
+            perf_df[[c for c in perf_cols if c in perf_df.columns]].style.map(
+                lambda v: "color: green" if isinstance(v, (int, float)) and v > 0
+                else ("color: red" if isinstance(v, (int, float)) and v < 0 else ""),
+                subset=["listing_gain_pct"],
+            ),
+            width="stretch", hide_index=True,
         )
 
 
-# ------------------------------------------------------------------
-# Sidebar — scan configuration
-# ------------------------------------------------------------------
+# ==================================================================
+# SIDEBAR
+# ==================================================================
 
 st.sidebar.title("📈 Screener Controls")
 
@@ -416,164 +529,126 @@ if not ok:
     st.sidebar.warning(token_msg)
 
 strategies = list_strategies()
-if not strategies:
-    st.sidebar.error("No strategies registered — see strategies/registry.py")
-    st.stop()
 
-strategy_keys = st.sidebar.multiselect(
-    "Strategies (pick one or more)",
-    options=list(strategies.keys()),
-    default=list(strategies.keys()),
-    format_func=lambda k: strategies[k],
-)
-if not strategy_keys:  # deselecting everything must not break the app
-    strategy_keys = [list(strategies.keys())[0]]
-st.sidebar.caption(
-    "Bench tip: data is fetched once per stock and shared by all "
-    "selected strategies — multi runs cost barely more than one."
-)
-
-universe = st.sidebar.radio(
-    "Universe",
-    options=["full", "nifty50"],
-    format_func=lambda u: "Full NSE (~2,300 stocks)" if u == "full" else "Nifty 50 sample (fast test)",
-    index=0,
-)
-st.sidebar.caption("Full NSE takes ~2–4 min; Nifty sample ~30 sec")
-
-c1, c2 = st.sidebar.columns(2)
-min_price = c1.number_input(
-    "Min ₹", value=UNIVERSE_SETTINGS["min_price"], step=50.0
-)
-max_price = c2.number_input(
-    "Max ₹", value=UNIVERSE_SETTINGS["max_price"], step=100.0
-)
-
-send_alert = st.sidebar.checkbox("Send Telegram alert", value=True)
-
-run_clicked = st.sidebar.button(
-    "🚀 Run Scan",
-    type="primary",
-    width="stretch",
-    disabled=not ok,
-    help="Runs the scan using today's saved token" if ok
-         else "First run: python core/auth.py",
-)
-
-
-# ------------------------------------------------------------------
-# Main area
-# ------------------------------------------------------------------
-
-st.title("NSE Stock Screener")
-# .get() fallback: a long-running Streamlit process can hold a stale
-# registry entry from before an edit (KeyError: 'timeframe' seen live).
-_tfs = sorted({(get_strategy(k) or {}).get("timeframe", "weekly")
-               for k in strategy_keys})
-st.caption(
-    f"Strategies: **{', '.join(strategies[k] for k in strategy_keys)}** · "
-    f"timeframe: {', '.join(_tfs)} · "
-    "signals are candidates for review, not trading advice"
-)
-
-if not ok:
-    st.info(
-        "**Step 1 — authenticate once (Option A):**\n\n"
-        "Open your terminal in the project folder and run:\n\n"
-        "```bash\npython core/auth.py\n```\n\n"
-        "Log in via the browser, paste the auth code, then refresh this page."
+st.sidebar.markdown("### 📂 Categories")
+selected_categories = {}
+for cat_key, cat_info in CATEGORIES.items():
+    if not any(s in strategies for s in cat_info["strategies"]):
+        continue
+    selected_categories[cat_key] = st.sidebar.checkbox(
+        cat_info["label"], value=True, help=cat_info["description"],
     )
-    st.stop()
 
+# Scan strategies ONLY — panels never enter the NSE engine
+scan_keys = [
+    s
+    for cat_key, sel in selected_categories.items()
+    if sel and CATEGORIES[cat_key]["kind"] == "scan"
+    for s in CATEGORIES[cat_key]["strategies"]
+    if s in strategies
+]
 
-# Separate event-driven (IPO) from regular scan strategies
-ipo_selected = "ipo_listing_gains" in strategy_keys
-scan_keys = [k for k in strategy_keys if k != "ipo_listing_gains"]
+st.sidebar.divider()
 
-# --- Run scan (regular strategies only) -------------------------------
-if run_clicked and scan_keys:
-    with st.spinner(
-        f"Scanning {'full NSE' if universe == 'full' else 'Nifty sample'} "
-        f"— fetching data, computing indicators…"
-    ):
-        results = run_screener(
+if scan_keys:
+    universe = st.sidebar.radio(
+        "Universe", ["nifty50", "full"],
+        format_func=lambda u: "Nifty 50 (fast)" if u == "nifty50" else "Full NSE (~2,300)",
+        index=0,
+    )
+    st.sidebar.caption("Full NSE ~2–4 min | Nifty 50 ~30 sec")
+    c1, c2 = st.sidebar.columns(2)
+    min_price = c1.number_input("Min ₹", value=UNIVERSE_SETTINGS["min_price"], step=50.0)
+    max_price = c2.number_input("Max ₹", value=UNIVERSE_SETTINGS["max_price"], step=100.0)
+    send_alert = st.sidebar.checkbox("Send Telegram alert", value=True)
+
+    run_clicked = st.sidebar.button(
+        "🚀 Run Scan", type="primary", width="stretch",
+        disabled=not ok,
+        help="Scans selected categories" if ok else "Run `python core/auth.py` first",
+    )
+else:
+    run_clicked = False
+    st.sidebar.info("Only panel categories selected — nothing to scan.")
+
+# Execute the scan ONCE, before tabs render
+if run_clicked:
+    with st.spinner(f"Scanning {len(scan_keys)} strategies on {universe}…"):
+        st.session_state["scan_result"] = run_screener(
             strategy_key=",".join(scan_keys),
             universe=universe,
             min_price=float(min_price),
             max_price=float(max_price),
             send_alert=send_alert,
         )
-    st.session_state["last_results"] = results
+    st.rerun()
 
-results = st.session_state.get("last_results")
+# ==================================================================
+# MAIN
+# ==================================================================
 
-if results and results.get("error") == "auth_required":
-    st.error(results["message"])
+st.title("📈 NSE Stock Screener")
+
+if not ok:
+    st.info(
+        "**Authenticate first (once per day)**\n\n"
+        "In your terminal run:\n\n"
+        "```bash\npython core/auth.py\n```\n\n"
+        "Then refresh this page."
+    )
     st.stop()
 
+selected_cats = [
+    k for k, sel in selected_categories.items()
+    if sel and any(s in strategies for s in CATEGORIES[k]["strategies"])
+]
 
-# --- Results: regular scan strategies ---------------------------------
-if results and not results.get("error"):
-    st.divider()
+if not selected_cats:
+    st.warning("Select at least one category in the sidebar.")
+    st.stop()
 
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Scanned", results["scanned"])
-    m2.metric("BUY signals", results["buy_count"])
-    m3.metric("SELL signals", results["sell_count"])
-    m4.metric("HOLD", results["hold_count"])
-    m5.metric("Scan time", results["scan_time"].strftime("%H:%M:%S"))
+tabs = st.tabs([CATEGORIES[k]["label"] for k in selected_cats])
 
-    scans = results["scans"] if results.get("multi") else [results]
-    if len(scans) > 1:
-        st.caption(
-            f"Headline numbers are the TOTAL across {len(scans)} strategies "
-            "— each tab shows that strategy's own scan."
-        )
-    tabs = st.tabs([f"🔥 {s['strategy']}" for s in scans])
-    for tab, res in zip(tabs, scans):
-        with tab:
-            _render_scan(res)
+for tab, cat_key in zip(tabs, selected_cats):
+    with tab:
+        kind = CATEGORIES[cat_key]["kind"]
+        if kind == "scan":
+            render_scan_category(cat_key)
+        elif cat_key == "global_macro":
+            render_global_macro()
+        elif cat_key == "event_driven":
+            render_event_driven()
 
-# --- Results: IPO Listing Gains (event-driven) ------------------------
-if ipo_selected:
-    st.divider()
-    _render_ipo_tab()
+# ==================================================================
+# History & Stats
+# ==================================================================
 
-
-# --- History + stats (from DuckDB) ----------------------------------
 st.divider()
 st.subheader("📜 Scan History & Stats")
 
 stats_key = st.selectbox(
-    "Stats & history for",
-    options=list(strategies.keys()),
+    "Stats for", options=list(strategies.keys()),
     format_func=lambda k: strategies[k],
-    index=list(strategies.keys()).index(strategy_keys[0]),
 )
+
 stats = get_strategy_stats(strategies[stats_key])
 if stats:
     s1, s2, s3, s4, s5 = st.columns(5)
-    s1.metric("Stored scans", stats.get("total_scans", 0))
+    s1.metric("Scans", stats.get("total_scans", 0))
     s2.metric("BUY rows", stats.get("buy_signals", 0))
     s3.metric("Evaluated BUYs", stats.get("evaluated_buys", 0))
     s4.metric("Avg 4W fwd", f"{stats.get('avg_forward_4w_return', 0):+.2f}%")
     s5.metric("Win rate", f"{stats.get('win_rate_pct', 0):.1f}%")
-    st.caption(f"Last scan recorded: {stats.get('last_scan', 'Never')}")
+    st.caption(f"Last scan: {stats.get('last_scan', 'Never')}")
 
 hist = get_scan_history(strategy_name=strategies[stats_key], limit=200)
-if hist.empty:
-    st.caption("No history yet — run a scan.")
-else:
-    filt = st.radio(
-        "Show", ["BUY only", "All signals"],
-        horizontal=True, index=0,
-    )
-    view = hist if filt == "All signals" else hist[hist["signal"] == "BUY"]
+if not hist.empty:
+    filt = st.radio("Show", ["BUY only", "All"], horizontal=True)
+    view = hist if filt == "All" else hist[hist["signal"] == "BUY"]
     st.dataframe(
-        view[[
-            "scan_time", "ticker", "signal", "current_price", "key_metrics",
-            "weekly_change_pct", "hist_avg_return",
-        ]],
-        width="stretch",
-        hide_index=True,
+        view[["scan_time", "ticker", "signal", "current_price",
+              "key_metrics", "weekly_change_pct", "hist_avg_return"]],
+        width="stretch", hide_index=True,
     )
+else:
+    st.caption("No history yet — run a scan.")

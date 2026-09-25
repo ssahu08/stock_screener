@@ -87,9 +87,10 @@ class IndexFollower(Strategy):
         """Fetch previous day close % for all tracked indices."""
         return self.fetcher.get_previous_close_pct(self.indices)
     
-    def generate_signals(self) -> List[Dict]:
+    def generate_signals(self, us_data: Optional[Dict] = None) -> List[Dict]:
         """Generate trade signals for next trading day."""
-        us_data = self.fetch_us_indices()
+        if us_data is None:
+            us_data = self.fetch_us_indices()
         signals = []
         
         for index_name, pct in us_data.items():
@@ -132,9 +133,10 @@ class IndexFollower(Strategy):
         
         return signals
     
-    def check_major_moves(self) -> List[Dict]:
+    def check_major_moves(self, us_data: Optional[Dict] = None) -> List[Dict]:
         """Check for major moves (>2%) for intraday alerts."""
-        us_data = self.fetch_us_indices()
+        if us_data is None:
+            us_data = self.fetch_us_indices()
         alerts = []
         
         for index_name, pct in us_data.items():
@@ -155,9 +157,9 @@ class IndexFollower(Strategy):
     
     def get_sod_plan(self) -> Dict:
         """Generate Start-of-Day trading plan."""
-        us_data = self.fetch_us_indices()
-        signals = self.generate_signals()
-        major_alerts = self.check_major_moves()
+        us_data = self.fetch_us_indices()  # ONE fetch, reused below
+        signals = self.generate_signals(us_data)
+        major_alerts = self.check_major_moves(us_data)
         
         return {
             "date": datetime.now().strftime("%Y-%m-%d"),
