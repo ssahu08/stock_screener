@@ -9,7 +9,7 @@ __pycache__/
 # Ignore local environment or secret keys
 .env
 .streamlit/secrets.toml
-config/keys.py
+# NOTE: config/keys.py is a committed LOADER with no secrets in it.
 
 # Ignore Database and cached tokens
 data/

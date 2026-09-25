@@ -6,8 +6,10 @@ Two kinds of categories:
   SCAN   — runs the NSE scan engine (Long Term, Breakout/BTST, Intraday)
   PANEL  — standalone panels, NEVER scan NSE (Global Macro, Event-Driven)
 
-Run: streamlit run app.py
-Login (once/day in terminal): python core/auth.py
+Run: streamlit run app.py        (or deploy to Streamlit Community Cloud)
+Password:  DASHBOARD_PASSWORD from .streamlit/secrets.toml (never in git)
+Fyers login (daily, ~6:30 AM IST expiry): in-app login box below,
+  or on a laptop: python core/auth.py
 """
 
 import os
@@ -34,8 +36,40 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# ------------------------------------------------------------------
+# PASSWORD GATE — runs before any other rendering (and before the heavy
+# imports), so visitors only ever see the login form.
+# Password lives in .streamlit/secrets.toml / Streamlit Cloud secrets,
+# never in git.
+# ------------------------------------------------------------------
+import hmac
+
+from config.keys import DASHBOARD_PASSWORD
+
+if not DASHBOARD_PASSWORD:
+    st.error(
+        "🔒 **Dashboard is locked:** `DASHBOARD_PASSWORD` is not configured.\n\n"
+        "Add `DASHBOARD_PASSWORD = \"...\"` to `.streamlit/secrets.toml` (local) "
+        "or to *App settings → Secrets* on Streamlit Community Cloud, then restart."
+    )
+    st.stop()
+
+if not st.session_state.get("unlocked"):
+    st.title("🔐 NSE Stock Screener")
+    st.caption("Enter the dashboard password to continue.")
+    with st.form("password_gate"):
+        _pw = st.text_input("Password", type="password")
+        _submit = st.form_submit_button("Unlock", type="primary")
+    if _submit:
+        if hmac.compare_digest(_pw.encode("utf-8"), DASHBOARD_PASSWORD.encode("utf-8")):
+            st.session_state["unlocked"] = True
+            st.rerun()
+        else:
+            st.error("Wrong password.")
+    st.stop()
+
 from config.settings import UNIVERSE_SETTINGS
-from core.auth import read_valid_token
+from core.auth import read_valid_token, build_auth_url, exchange_auth_code
 from engine import run_screener, get_fyers_client
 from storage.db import get_scan_history, get_strategy_stats
 from strategies.registry import list_strategies
@@ -92,7 +126,44 @@ CATEGORIES = {
 def token_status() -> tuple[bool, str]:
     if read_valid_token():
         return True, "✅ Fyers token valid for today"
-    return False, "🔐 No valid token — run `python core/auth.py` once"
+    return False, "🔐 Not logged in — use the Fyers login box below"
+
+
+def render_fyers_login() -> None:
+    """Mobile-friendly Fyers login: open the link, paste the redirect URL.
+
+    The auth_code is pasted by the user directly into their own dashboard
+    and exchanged server-side — it never passes through chat or logs.
+    """
+    st.warning("🔐 Daily Fyers login required — access tokens expire ~6:30 AM IST.")
+    st.markdown(
+        "**Log in from this device (takes 30 seconds):**\n\n"
+        "1. Tap **Open Fyers Login** and log in on the Fyers page\n"
+        "2. **Copy the full URL** from the browser address bar "
+        "(it contains `auth_code=`)\n"
+        "3. Paste it below and tap **Sign in**"
+    )
+    st.link_button("🔓 Open Fyers Login", build_auth_url(), type="primary")
+    pasted = st.text_input(
+        "Paste the redirect URL (or auth_code):",
+        key="fyers_paste",
+        placeholder="https://trade.fyers.in/api-login/redirect-uri/index.html?auth_code=…",
+    )
+    if st.button(
+        "✅ Sign in", type="primary",
+        disabled=not pasted.strip(), key="fyers_submit",
+    ):
+        with st.spinner("Exchanging auth_code for an access token…"):
+            success, message = exchange_auth_code(pasted)
+        if success:
+            st.success("Logged in! Loading dashboard…")
+            st.rerun()
+        else:
+            st.error(
+                f"{message}\n\n"
+                "The auth_code expires ~2 minutes after login — copy the URL "
+                "right after you land on the redirect page, then try again."
+            )
 
 
 def buys_frame(rows: list[dict]) -> pd.DataFrame:
@@ -565,11 +636,16 @@ if scan_keys:
     run_clicked = st.sidebar.button(
         "🚀 Run Scan", type="primary", width="stretch",
         disabled=not ok,
-        help="Scans selected categories" if ok else "Run `python core/auth.py` first",
+        help="Scans selected categories" if ok else "Log in via the Fyers box first",
     )
 else:
     run_clicked = False
     st.sidebar.info("Only panel categories selected — nothing to scan.")
+
+st.sidebar.divider()
+if st.sidebar.button("🔒 Log out", help="Lock the dashboard (password required again)"):
+    st.session_state.pop("unlocked", None)
+    st.rerun()
 
 # Execute the scan ONCE, before tabs render
 if run_clicked:
@@ -590,12 +666,7 @@ if run_clicked:
 st.title("📈 NSE Stock Screener")
 
 if not ok:
-    st.info(
-        "**Authenticate first (once per day)**\n\n"
-        "In your terminal run:\n\n"
-        "```bash\npython core/auth.py\n```\n\n"
-        "Then refresh this page."
-    )
+    render_fyers_login()
     st.stop()
 
 selected_cats = [

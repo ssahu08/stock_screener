@@ -28,7 +28,7 @@ import requests
 import pandas as pd
 
 from strategies.base import Strategy
-from config.keys import APIFY_TOKEN  # add to keys.py
+from config.keys import APIFY_TOKEN  # value comes from .streamlit/secrets.toml
 
 
 APIFY_BASE = "https://contented-academy--indian-ipo-tracker-api.apify.actor/api"

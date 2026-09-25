@@ -31,7 +31,17 @@ class FinnhubSource(IndexDataSource):
     BASE_URL = "https://finnhub.io/api/v1"
     
     def __init__(self, api_key: str = None):
-        self.api_key = api_key or os.getenv("FINNHUB_API_KEY")
+        # Fall back to project secrets (.streamlit/secrets.toml) so Finnhub
+        # also works on Streamlit Cloud where no env vars are set.
+        if not api_key:
+            api_key = os.getenv("FINNHUB_API_KEY")
+        if not api_key:
+            try:
+                from config.keys import get_secret
+                api_key = get_secret("FINNHUB_TOKEN")
+            except Exception:
+                api_key = ""
+        self.api_key = api_key
         if not self.api_key:
             raise ValueError("FINNHUB_API_KEY required")
     

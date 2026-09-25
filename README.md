@@ -36,7 +36,7 @@ python engine.py -s volcano_watch,volcano_blast,volcano_snap -u nifty50
 ```
 stock_screener/
 ├── config/
-│   ├── keys.py              # Fyers + Telegram credentials (gitignored)
+│   ├── keys.py              # secret loader (values from .streamlit/secrets.toml)
 │   └── settings.py          # Universe filters, thresholds, workers
 ├── core/
 │   ├── auth.py              # Option A login (run by YOU, token stays local)
@@ -142,11 +142,26 @@ It now appears in the CLI menu and the Streamlit sidebar automatically.
 - **Price filter:** ₹50–₹2,000 (configurable in sidebar / settings.py)
 - **Storage:** DuckDB (`data/screener.duckdb`), keeps the 2 most recent
   scans per strategy; older scans are pruned automatically
-- **Alerts:** Telegram summary of top BUY setups (configured in keys.py)
+- **Alerts:** Telegram summary of top BUY setups (configured in `.streamlit/secrets.toml`)
 
-## Security notes (Option A)
+## Security notes
 
-- The Fyers login is **run by you** in your own terminal — tokens never
-  pass through chat transcripts or shared environments.
-- `config/keys.py`, `data/`, `logs/`, and `*.csv` are gitignored.
-- Fyers access tokens expire daily; the app only checks for today's token.
+- **Password gate:** the dashboard asks for `DASHBOARD_PASSWORD` before
+  anything renders (set it in `.streamlit/secrets.toml`, or in Streamlit
+  Community Cloud's *App settings → Secrets*). Sidebar has a Log out button.
+- **No secrets in git:** `config/keys.py` is a committed *loader*; real
+  values live in `.streamlit/secrets.toml` (gitignored) or Streamlit
+  Community Cloud's encrypted Secrets store. Old secret-bearing versions
+  of `keys.py` were purged from git history (all commits rewritten).
+- **The Fyers login is run by you** — paste the redirect URL into your own
+  dashboard's login box (or `python core/auth.py` in a terminal); tokens
+  never pass through chat transcripts or shared environments.
+- **Token storage:** `data/fyers_token.txt` on your machine / app server
+  only — never displayed, never logged. Fyers access tokens expire daily
+  (~6:30 AM IST); the app only checks for today's token.
+- `data/`, `logs/`, `.streamlit/secrets.toml`, and `*.csv` are gitignored.
+
+## Cloud deployment (mobile access)
+
+See [CLOUD_SETUP.md](CLOUD_SETUP.md) — Streamlit Community Cloud setup:
+password, secrets, daily Fyers login from your phone, keep-alive ping.

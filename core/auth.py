@@ -147,6 +147,91 @@ def quick_validate_token() -> bool:
     return read_valid_token() is not None
 
 
+# ------------------------------------------------------------------
+# In-app login helpers (used by the dashboard's login box, e.g. on
+# a phone where there is no terminal). The auth_code is pasted by the
+# USER into their OWN dashboard — it never travels through chat.
+# ------------------------------------------------------------------
+
+def _token_path() -> str:
+    return os.path.normpath(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..", "data", "fyers_token.txt",
+    ))
+
+
+def _save_tokens(access_token: str, refresh_token: str = "") -> str:
+    """Persist today's access token (mtime = now keeps 'valid today' check)."""
+    path = _token_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write(access_token)
+    os.utime(path, None)
+    if refresh_token:
+        with open(path + ".refresh", "w") as f:
+            f.write(refresh_token)
+    return path
+
+
+def build_auth_url() -> str:
+    """Fyers login URL — open it in any browser (including a phone's)."""
+    session = fyersModel.SessionModel(
+        client_id=CLIENT_ID,
+        secret_key=SECRET_KEY,
+        redirect_uri=REDIRECT_URI,
+        response_type="code",
+        grant_type="authorization_code",
+    )
+    return session.generate_authcode()
+
+
+def extract_auth_code(pasted: str) -> str:
+    """Accept a full redirect URL (...?auth_code=XYZ) OR a bare auth_code."""
+    from urllib.parse import urlparse, parse_qs, unquote
+
+    pasted = (pasted or "").strip()
+    if "auth_code=" in pasted:
+        parsed = urlparse(pasted)
+        for chunk in (parsed.query, parsed.fragment):
+            code = parse_qs(chunk).get("auth_code", [""])[0]
+            if code:
+                return unquote(code)
+    return pasted
+
+
+def exchange_auth_code(pasted: str) -> tuple[bool, str]:
+    """Exchange a pasted redirect URL / auth_code for an access token.
+
+    Runs server-side (the user's own dashboard), saves the token under
+    data/ and never returns the token itself.
+
+    Returns:
+        (True, "Login successful") or (False, reason)
+    """
+    code = extract_auth_code(pasted)
+    if not code:
+        return False, "No auth_code found — paste the full redirect URL."
+
+    session = fyersModel.SessionModel(
+        client_id=CLIENT_ID,
+        secret_key=SECRET_KEY,
+        redirect_uri=REDIRECT_URI,
+        response_type="code",
+        grant_type="authorization_code",
+    )
+    session.set_token(code)
+    try:
+        response = session.generate_token()
+    except Exception as exc:
+        return False, f"Fyers API error: {exc}"
+
+    if not isinstance(response, dict) or "access_token" not in response:
+        return False, str(response)[:400]
+
+    _save_tokens(response["access_token"], response.get("refresh_token", ""))
+    return True, "Login successful"
+
+
 def read_valid_token() -> Optional[str]:
     """NON-INTERACTIVE token read (used by engine.py / app.py).
 

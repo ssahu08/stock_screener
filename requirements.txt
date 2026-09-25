@@ -4,3 +4,5 @@ numpy
 requests
 duckdb
 fyers-apiv3
+yfinance
+beautifulsoup4
