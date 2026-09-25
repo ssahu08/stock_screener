@@ -7,7 +7,8 @@
 # - Volume confirmation on entry
 # - Fixed intraday stop loss (1.5x ATR) + forced same-day exit at 14:30 IST
 # - Proper risk:reward (1:3 target)
-# - Only Thursday expiry day, 9:30-11:30 entry window
+# - Only expiry day (NSE: TUESDAYS since 01-Sep-2025; Thursdays before),
+#   9:30-11:30 entry window
 
 import pandas as pd
 import numpy as np
@@ -27,7 +28,7 @@ from config.keys import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 class SpreadConfig:
     """Configuration for credit spreads."""
     index: str = "NIFTY"           # "NIFTY" or "BANKNIFTY"
-    lot_size: int = 25             # NIFTY=25, BANKNIFTY=15
+    lot_size: int = 65             # NIFTY=65, BANKNIFTY=30 (SEBI revision, eff. Jan-2026)
     strike_step: int = 50          # NIFTY=50, BANKNIFTY=100
     spread_width_pct: float = 1.0  # Width between strikes (% of spot)
     short_strike_pct: float = 1.0  # Short strike OTM (%)
@@ -57,9 +58,115 @@ DEFAULT_CONFIG = SpreadConfig()
 # Helper Functions
 # -----------------------------------------------------------------------------
 
-def is_expiry_day(dt: pd.Timestamp) -> bool:
-    """Check if date is Thursday (weekly expiry)."""
-    return dt.dayofweek == 3  # Monday=0, Thursday=3
+# -----------------------------------------------------------------------------
+# Expiry-day regimes (NSE)
+# -----------------------------------------------------------------------------
+# * Until 31-Aug-2025 NSE index derivatives expired on THURSDAYS.
+# * W.e.f. 01-Sep-2025 (NSE circular NSE/FAOP/68685) ALL NSE index & stock
+#   derivatives expire on TUESDAYS.  If Tuesday is a trading holiday the
+#   expiry shifts to the PREVIOUS trading day.
+# * BANKNIFTY/FINNIFTY/MIDCPNIFTY weekly expiry was discontinued from
+#   20-Nov-2024 (SEBI: one weekly index per exchange — NSE kept NIFTY 50).
+#   BANKNIFTY now expires monthly only: last Thursday until Aug-2025,
+#   last Tuesday from Sep-2025.
+# * One-time transition: the 04-Sep-2025 weekly expiry moved to 09-Sep-2025,
+#   so there was NO expiry in the 01–08 Sep-2025 window.
+
+TUESDAY_RULE_FROM = pd.Timestamp("2025-09-01")
+BANKNIFTY_MONTHLY_ONLY_FROM = pd.Timestamp("2024-11-20")
+_NIFTY_TRANSITION_GAP = (pd.Timestamp("2025-09-01"), pd.Timestamp("2025-09-09"))
+_WEEKDAY_FREQ = {0: "W-MON", 1: "W-TUE", 2: "W-WED", 3: "W-THU", 4: "W-FRI"}
+
+
+def is_expiry_day(dt: pd.Timestamp, index_name: str = "NIFTY") -> bool:
+    """True if `dt` falls on a scheduled NSE expiry weekday (regime-aware).
+
+    Weekday-only approximation — it does not know the exchange holiday
+    calendar.  For exact backtest masks (holiday shifts included) use
+    compute_expiry_mask().
+    """
+    dt = pd.Timestamp(dt)
+    if index_name == "NIFTY":
+        if dt < TUESDAY_RULE_FROM:
+            return dt.dayofweek == 3  # Thursday era
+        if _NIFTY_TRANSITION_GAP[0] <= dt < _NIFTY_TRANSITION_GAP[1]:
+            return False  # one-time Sep-2025 transition week
+        return dt.dayofweek == 1  # Tuesday era (weekly = every Tuesday)
+    # BANKNIFTY: weekly Thursday until 20-Nov-2024, monthly only afterwards
+    if dt < BANKNIFTY_MONTHLY_ONLY_FROM:
+        return dt.dayofweek == 3
+    last_weekday = 3 if dt < TUESDAY_RULE_FROM else 1  # last Thu -> last Tue
+    return dt.dayofweek == last_weekday and (dt + pd.Timedelta(days=7)).month != dt.month
+
+
+def _scheduled_days(first: pd.Timestamp, last: pd.Timestamp, weekday: int) -> pd.DatetimeIndex:
+    """Calendar dates with `weekday` (0=Mon) in [first, last]."""
+    return pd.date_range(first, last, freq=_WEEKDAY_FREQ[weekday])
+
+
+def _last_of_month(days: pd.DatetimeIndex) -> pd.DatetimeIndex:
+    """Final occurrence per calendar month (all `days` share one weekday)."""
+    if len(days) == 0:
+        return days
+    s = pd.Series(days)
+    return pd.DatetimeIndex(s.groupby(s.dt.to_period("M")).max())
+
+
+def compute_expiry_dates(trading_days, index_name: str = "NIFTY") -> set:
+    """Exact expiry dates implied by the trading days present in the data.
+
+    Applies the regime rules above, then adjusts each scheduled expiry to the
+    previous trading day when the scheduled day is an exchange holiday (the
+    data only contains bars on trading days).
+    """
+    days = pd.DatetimeIndex(sorted({pd.Timestamp(d).normalize() for d in trading_days}))
+    days = days[days.dayofweek < 5]
+    if len(days) == 0:
+        return set()
+
+    def _adjust(schedule: pd.DatetimeIndex) -> set:
+        out = set()
+        for sched in schedule:
+            pos = int(days.searchsorted(sched, side="right")) - 1
+            if pos >= 0:
+                cand = days[pos]
+                if (sched - cand).days < 7:  # allow only small holiday shifts
+                    out.add(cand)
+        return out
+
+    expiries = set()
+
+    if index_name == "NIFTY":
+        thu = _scheduled_days(days[0], days[-1], 3)
+        thu = thu[thu < TUESDAY_RULE_FROM]
+        tue = _scheduled_days(days[0], days[-1], 1)
+        tue = tue[
+            (tue >= TUESDAY_RULE_FROM)
+            & ~((tue >= _NIFTY_TRANSITION_GAP[0]) & (tue < _NIFTY_TRANSITION_GAP[1]))
+        ]
+        expiries |= _adjust(thu) | _adjust(tue)
+    else:
+        # Weekly-Thursday era (all Thursdays before the weekly ban)
+        thu = _scheduled_days(days[0], days[-1], 3)
+        expiries |= _adjust(thu[thu < BANKNIFTY_MONTHLY_ONLY_FROM])
+        # Monthly only afterwards: last Thursday, then last Tuesday from Sep-2025
+        monthly = _last_of_month(thu)
+        monthly = monthly[
+            (monthly >= BANKNIFTY_MONTHLY_ONLY_FROM) & (monthly < TUESDAY_RULE_FROM)
+        ]
+        expiries |= _adjust(monthly)
+        tue = _last_of_month(_scheduled_days(days[0], days[-1], 1))
+        expiries |= _adjust(tue[tue >= TUESDAY_RULE_FROM])
+
+    return expiries
+
+
+def compute_expiry_mask(index: pd.DatetimeIndex, index_name: str = "NIFTY") -> pd.Series:
+    """Boolean Series over `index`: True on expiry-day bars."""
+    expiries = compute_expiry_dates(index, index_name)
+    if not expiries:
+        return pd.Series(False, index=index)
+    return pd.Series(pd.DatetimeIndex(index).normalize().isin(expiries), index=index)
 
 
 def resample_to_15min(df_5min: pd.DataFrame) -> pd.DataFrame:
@@ -176,7 +283,7 @@ def compute_indicators(df: pd.DataFrame, config: SpreadConfig) -> pd.DataFrame:
         (df["TIME"] >= time(4, 0)) &
         (df["TIME"] <= time(6, 0))
     )
-    df["IS_EXPIRY"] = df.index.to_series().apply(lambda x: x.dayofweek == 3)
+    df["IS_EXPIRY"] = compute_expiry_mask(df.index, config.index)
 
     return df
 
@@ -357,7 +464,9 @@ class ExpiryCreditSpread(Strategy):
     Expiry Day Credit Spread Strategy v2.
     
     Rules:
-    - Only Thursday (weekly expiry)
+    - Only expiry day: NIFTY = every Tuesday (holiday -> previous trading
+      day); BANKNIFTY = monthly, last Tuesday (weekly expiry discontinued
+      20-Nov-2024).  Before 01-Sep-2025 expiry fell on Thursdays.
     - 15-min chart (resampled from 5-min)
     - Strong trend: Price > VWAP & EMA for 2+ consecutive candles, ADX > 20
     - Entry: Pullback to VWAP/EMA zone, then reclaim with volume spike
@@ -415,7 +524,7 @@ class ExpiryCreditSpread(Strategy):
     def backtest(self, df: pd.DataFrame, capital: float = 50000) -> Dict[str, Any]:
         df = self.compute(df)
 
-        expiry_days = df[df.index.to_series().apply(lambda x: x.dayofweek == 3)]
+        expiry_days = df[df["IS_EXPIRY"] == True]
         if expiry_days.empty:
             return {"error": "No expiry days in data"}
 
@@ -552,4 +661,4 @@ def register(registry_mod):
     @registry_mod.register_strategy
     class _BuiltInExpiryCreditSpreadBankNifty(ExpiryCreditSpread):
         def __init__(self):
-            super().__init__(SpreadConfig(index="BANKNIFTY", lot_size=15, strike_step=100))
+            super().__init__(SpreadConfig(index="BANKNIFTY", lot_size=30, strike_step=100))

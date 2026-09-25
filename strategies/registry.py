@@ -81,7 +81,7 @@ class _BuiltInExpiryCreditSpreadNifty(ExpiryCreditSpread):
 @register_strategy
 class _BuiltInExpiryCreditSpreadBankNifty(ExpiryCreditSpread):
     def __init__(self):
-        super().__init__(SpreadConfig(index="BANKNIFTY", lot_size=15))
+        super().__init__(SpreadConfig(index="BANKNIFTY", lot_size=30, strike_step=100))
 
 # --- Global Macro -----------------------------------------------------------
 @register_strategy
