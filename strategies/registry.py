@@ -14,6 +14,7 @@ from strategies.volcano import (
     VolcanoSnap,
 )
 from strategies.ipo_listing import IPOListingGains
+from strategies.expiry_credit_spread import ExpiryCreditSpread, SpreadConfig
 
 # Auto-register all subclasses of Strategy discovered in the strategies/ folder
 # This makes adding new strategies as simple as creating a new file.
@@ -69,6 +70,17 @@ class _BuiltInVolcanoSnap(VolcanoSnap):
 @register_strategy
 class _BuiltInIPOListingGains(IPOListingGains):
     pass
+
+# --- Expiry Credit Spreads --------------------------------------------------
+@register_strategy
+class _BuiltInExpiryCreditSpreadNifty(ExpiryCreditSpread):
+    def __init__(self):
+        super().__init__(SpreadConfig(index="NIFTY"))
+
+@register_strategy
+class _BuiltInExpiryCreditSpreadBankNifty(ExpiryCreditSpread):
+    def __init__(self):
+        super().__init__(SpreadConfig(index="BANKNIFTY", lot_size=15))
 
 # At module load time, populate registry
 # (The @register_strategy decorator already added above)
