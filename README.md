@@ -168,3 +168,11 @@ It now appears in the CLI menu and the Streamlit sidebar automatically.
 
 See [CLOUD_SETUP.md](CLOUD_SETUP.md) — Streamlit Community Cloud setup:
 password, secrets, daily Fyers login from your phone, keep-alive ping.
+
+## Documentation
+
+| Document | For |
+|---|---|
+| [docs/technical-design-document.md](docs/technical-design-document.md) | architecture, tech stack, components, infra, security, roadmap |
+| [docs/brd.md](docs/brd.md) | business requirements, scope, rules, acceptance criteria |
+| [docs/user-guide.md](docs/user-guide.md) | complete end-user manual (login, every category, alerts, troubleshooting) |
