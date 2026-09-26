@@ -16,6 +16,7 @@ from strategies.volcano import (
 from strategies.ipo_listing import IPOListingGains
 from strategies.expiry_credit_spread import ExpiryCreditSpread, SpreadConfig
 from strategies.global_macro.index_follower import IndexFollower
+from strategies.bb_pivot_reversion import BBPivotWashoutDaily, BBPivotWashout60
 
 # Auto-register all subclasses of Strategy discovered in the strategies/ folder
 # This makes adding new strategies as simple as creating a new file.
@@ -86,6 +87,15 @@ class _BuiltInExpiryCreditSpreadBankNifty(ExpiryCreditSpread):
 # --- Global Macro -----------------------------------------------------------
 @register_strategy
 class _BuiltInIndexFollower(IndexFollower):
+    pass
+
+# --- TEST BENCH (feature/bb-pivot-test branch only — NOT in production) -----
+@register_strategy
+class _TestBBPivotWashout(BBPivotWashoutDaily):
+    pass
+
+@register_strategy
+class _TestBBPivotWashout60(BBPivotWashout60):
     pass
 
 # At module load time, populate registry

@@ -125,6 +125,17 @@ CATEGORIES = {
         "strategies": ["ipo_listing_gains"],
         "description": "IPO listing gains tracker (Apify + NSE cross-check)",
     },
+    # TEST BENCH — feature/bb-pivot-test branch only; never merged to
+    # production until the owner validates it on real charts.
+    "test_bench": {
+        "label": "🧪 Test Bench",
+        "kind": "scan",
+        "strategies": ["bb_pivot_washout", "bb_pivot_washout_60"],
+        "description": (
+            "TEST ONLY — Bollinger-Pivot confluence washout "
+            "(<=0.5% gap, close below band). Unvalidated: charts/paper only."
+        ),
+    },
 }
 
 
