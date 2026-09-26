@@ -70,6 +70,11 @@ While the app is awake, the built-in scheduler (`core/scheduler.py`) sends:
 open/high/low/close summary. State lives in `data/scheduler_state.json`
 (resets on redeploy — at most one duplicate per job after a redeploy).
 
+> **Run ONE instance only.** Once the cloud app is live, close the local
+> dashboard (or start it with `SCREENER_SCHEDULER_DISABLE=1`) — each
+> instance has its own state file, so two running instances would send
+> **every Telegram message twice**.
+
 ## 4. Updating the app (your laptop → phone workflow)
 
 ```bash
