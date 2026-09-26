@@ -75,6 +75,13 @@ open/high/low/close summary. State lives in `data/scheduler_state.json`
 > instance has its own state file, so two running instances would send
 > **every Telegram message twice**.
 
+> **Alerts start with one real visit.** Streamlit only executes app code
+> when a browser session connects, and the scheduler starts *after* the
+> password gate — so after every redeploy/restart, **open and unlock the
+> dashboard once**. Your daily Fyers login does exactly that every morning;
+> after that, jobs keep firing even if you close the tab. The UptimeRobot
+> ping keeps the *container* awake but does not start the jobs itself.
+
 ## 4. Updating the app (your laptop → phone workflow)
 
 ```bash
