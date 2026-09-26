@@ -115,6 +115,32 @@ def _ensure_schema(con) -> None:
             )
             print(f"🧩 Migrated DB schema: added column '{col}'")
 
+    # Monthly Open=Low review table (owner brief point 2) — additive,
+    # idempotent; never touches multi_strategy_scans.
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS monthly_open_low (
+            symbol VARCHAR,
+            trade_month DATE,
+            entry_date DATE,
+            entry_open DOUBLE,
+            entry_low DOUBLE,
+            entry_close DOUBLE,
+            close_price DOUBLE,
+            high_since DOUBLE,
+            low_since DOUBLE,
+            current_return_pct DOUBLE,
+            max_return_pct DOUBLE,
+            max_drawdown_pct DOUBLE,
+            status VARCHAR,          -- ACTIVE | CHECKED | CLOSED
+            created_at TIMESTAMP,
+            updated_at TIMESTAMP
+        )
+    """)
+    con.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_monthly_open_low
+        ON monthly_open_low (symbol, trade_month)
+    """)
+
 
 def _get_connection():
     """Get a connected DuckDB instance, creating/migrating schema as needed."""
@@ -122,6 +148,12 @@ def _get_connection():
     con = duckdb.connect(DB_PATH)
     _ensure_schema(con)
     return con
+
+
+def get_connection():
+    """Public wrapper around _get_connection (same single-writer rules:
+    close before another writer opens — DuckDB allows one at a time)."""
+    return _get_connection()
 
 
 def _frame_in_canonical_order(rows) -> pd.DataFrame:

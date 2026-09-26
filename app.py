@@ -95,6 +95,16 @@ CATEGORIES = {
         "strategies": ["hilega_milega"],
         "description": "Weekly momentum, trend following — 2-week live trial",
     },
+    "open_low": {
+        "label": "🕯️ Open=Low",
+        "kind": "scan",
+        "strategies": ["open_low_1d", "open_low_1w", "open_low_1m"],
+        "description": (
+            "Long-term candidates: exact Open==Low candle + Supertrend (10,3) "
+            "flip. Top picks per timeframe + 1st-of-month review table."
+        ),
+        "extras": "open_low",
+    },
     "breakout": {
         "label": "🚀 Breakout / BTST",
         "kind": "scan",
@@ -254,15 +264,21 @@ def render_scan_category(cat_key: str) -> None:
     res = st.session_state.get("scan_result")
     if res is None:
         st.info("👈 Click **Run Scan** in the sidebar to scan this category.")
+        if info.get("extras") == "open_low":
+            render_open_low_extras()   # persistent review table — scan not needed
         return
     if res.get("error"):
         st.warning(res.get("message", "Scan failed."))
+        if info.get("extras") == "open_low":
+            render_open_low_extras()
         return
 
     scans = res["scans"] if res.get("multi") else [res]
     mine = [s for s in scans if s.get("strategy_key") in info["strategies"]]
     if not mine:
         st.info("The last scan didn't include this category. Click **Run Scan** again.")
+        if info.get("extras") == "open_low":
+            render_open_low_extras()
         return
 
     m1, m2, m3, m4, m5 = st.columns(5)
@@ -279,6 +295,115 @@ def render_scan_category(cat_key: str) -> None:
         for tab, s in zip(tabs, mine):
             with tab:
                 _render_scan(s)
+
+    if info.get("extras") == "open_low":
+        render_open_low_extras()
+
+
+# ------------------------------------------------------------------
+# Open=Low extras — monthly review table (owner brief point 2)
+# ------------------------------------------------------------------
+
+def _scan_tickers(res: dict) -> list:
+    """Clean tickers from the last scan's rows (any strategy)."""
+    if not res or res.get("error"):
+        return []
+    scans = res["scans"] if res.get("multi") else [res]
+    out = []
+    for s in scans:
+        for row in s.get("all_results") or []:
+            t = row.get("ticker")
+            if t and t not in out:
+                out.append(t)
+    return out
+
+
+def _maybe_auto_capture(res: dict) -> None:
+    """Once per calendar month, capture 1st-of-month Open=Low candidates
+    after a Nifty-50 scan. Never breaks the scan itself."""
+    import datetime as _dt
+
+    from strategies.open_low_tracker import refresh_tracker
+
+    month_key = _dt.date.today().replace(day=1).isoformat()
+    if st.session_state.get("ol_tracker_month") == month_key:
+        return
+    tickers = _scan_tickers(res)
+    if not tickers or len(tickers) > 120:  # auto = small universes only
+        return
+    fyers = get_fyers_client()
+    if fyers is None:
+        return
+    try:
+        with st.spinner("🕯️ Capturing 1st-of-month Open=Low candidates (once per month)…"):
+            info = refresh_tracker(tickers, fyers)
+        st.session_state["ol_tracker_month"] = month_key
+        st.session_state["ol_tracker_msg"] = info
+    except Exception as exc:  # noqa: BLE001 — tracker must never break a scan
+        st.session_state["ol_tracker_month"] = month_key  # don't retry every scan
+        st.session_state["ol_tracker_msg"] = {"error": str(exc)}
+
+
+def render_open_low_extras() -> None:
+    """Monthly review table + manual refresh (below the 1D/1W/1M tabs)."""
+    st.divider()
+    st.subheader("📋 Monthly Open=Low Review")
+    st.caption(
+        "1st daily candle of the month with exact Open == Low → candidate "
+        "for a bull trend that month. Captured automatically after the first "
+        "Nifty-50 scan each month."
+    )
+
+    try:
+        from strategies.open_low_tracker import get_monthly_table
+        table = get_monthly_table()
+    except Exception as exc:  # noqa: BLE001
+        st.warning(f"Monthly tracker unavailable: {exc}")
+        return
+
+    msg = st.session_state.pop("ol_tracker_msg", None)
+    if msg:
+        if "error" in msg:
+            st.caption(f"⚠️ Last capture failed: {msg['error']}")
+        else:
+            st.caption(
+                f"Last capture — checked {msg.get('checked', 0)}, "
+                f"candidates {msg.get('candidates', 0)}, "
+                f"prices refreshed {msg.get('refreshed', 0)}, "
+                f"already done {msg.get('already_done', 0)}."
+            )
+
+    if table is None or table.empty:
+        st.info("⚪ No candidates yet this month — will appear after the next scan.")
+    else:
+        st.dataframe(
+            table.style.map(
+                lambda v: "color: green" if isinstance(v, (int, float)) and v > 0
+                else ("color: red" if isinstance(v, (int, float)) and v < 0 else ""),
+                subset=["current_return_pct", "max_return_pct", "max_drawdown_pct"],
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+
+    if st.button("🔄 Refresh monthly tracker"):
+        fyers = get_fyers_client()
+        if fyers is None:
+            st.warning("Fyers login required first.")
+        else:
+            from strategies.open_low_tracker import refresh_tracker
+            symbols = _scan_tickers(st.session_state.get("scan_result"))
+            if not symbols:
+                from core.data import get_nifty50_symbols
+                symbols = [t.split(":")[1].replace("-EQ", "")
+                           for t in get_nifty50_symbols()]
+            with st.spinner("Refreshing monthly tracker…"):
+                try:
+                    info = refresh_tracker(symbols, fyers)
+                    st.session_state["ol_tracker_msg"] = info
+                except Exception as exc:  # noqa: BLE001
+                    st.session_state["ol_tracker_msg"] = {"error": str(exc)}
+            st.rerun()
 
 
 # ------------------------------------------------------------------
@@ -677,6 +802,8 @@ if run_clicked:
             max_price=float(max_price),
             send_alert=send_alert,
         )
+    if "open_low_1d" in scan_keys:
+        _maybe_auto_capture(st.session_state["scan_result"])
     st.rerun()
 
 # ==================================================================

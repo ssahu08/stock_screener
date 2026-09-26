@@ -172,6 +172,11 @@ def main() -> int:
 
         df = resample_to_weekly(df)
 
+    # Engine frames may carry dates in a Timestamp column (weekly is
+    # RangeIndex + Timestamp) — normalise so date printing works.
+    if "Timestamp" in df.columns:
+        df = df.set_index("Timestamp")
+
     # --- replay ------------------------------------------------------------
     print(f"[2/2] Replaying {entry['name']} on {len(df)} {tf} bars…\n")
     out = strat.compute(df)
@@ -188,13 +193,19 @@ def main() -> int:
     print(f"Signals: {len(sigs)} total | {len(hist)} historical (live bar excluded from stats)")
 
     if len(hist):
-        print(f"\n  {'date':<11} {'close':>9} {'shelf':>5} {'gap%':>6} "
-              f"{'O-dist':>7} {'C-band':>7} {f'+{f_short}d':>8} {f'+{f_long}d':>8}")
-        for ts in hist.index:
-            r = out.loc[ts]
-            print(f"  {ts.date()!s:<11} {r['Close']:>9.2f} {str(r['PIV_NAME']):>5} "
-                  f"{r['GAP_PCT']:>6.2f} {r['OPEN_DIST_PCT']:>6.2f}% "
-                  f"{r['PEN_PCT']:>+6.2f}% {fwd_s.loc[ts]:>+7.2f}% {fwd_l.loc[ts]:>+7.2f}%")
+        if "PIV_NAME" in out.columns:          # BB-Pivot's own columns
+            print(f"\n  {'date':<11} {'close':>9} {'shelf':>5} {'gap%':>6} "
+                  f"{'O-dist':>7} {'C-band':>7} {f'+{f_short}d':>8} {f'+{f_long}d':>8}")
+            for ts in hist.index:
+                r = out.loc[ts]
+                print(f"  {ts.date()!s:<11} {r['Close']:>9.2f} {str(r['PIV_NAME']):>5} "
+                      f"{r['GAP_PCT']:>6.2f} {r['OPEN_DIST_PCT']:>6.2f}% "
+                      f"{r['PEN_PCT']:>+6.2f}% {fwd_s.loc[ts]:>+7.2f}% {fwd_l.loc[ts]:>+7.2f}%")
+        else:                                   # any other strategy
+            print(f"\n  {'date':<11} {'close':>9}  state at signal")
+            for ts in hist.index:
+                state = strat.format_metrics(out.loc[:ts])
+                print(f"  {ts.date()!s:<11} {out['Close'].loc[ts]:>9.2f}  {state}")
         hs, hl = fwd_s.loc[hist.index].dropna(), fwd_l.loc[hist.index].dropna()
         if len(hs):
             print(f"\n  avg +{f_short}d {hs.mean():+.2f}% ({(hs > 0).mean() * 100:.0f}% > 0) | "

@@ -17,6 +17,7 @@ from strategies.ipo_listing import IPOListingGains
 from strategies.expiry_credit_spread import ExpiryCreditSpread, SpreadConfig
 from strategies.global_macro.index_follower import IndexFollower
 from strategies.bb_pivot_reversion import BBPivotWashoutDaily, BBPivotWashout60
+from strategies.open_low import OpenLow
 
 # Auto-register all subclasses of Strategy discovered in the strategies/ folder
 # This makes adding new strategies as simple as creating a new file.
@@ -88,6 +89,23 @@ class _BuiltInExpiryCreditSpreadBankNifty(ExpiryCreditSpread):
 @register_strategy
 class _BuiltInIndexFollower(IndexFollower):
     pass
+
+# --- Open=Low (owner's Strategy 1 — long-term candidates, spec in
+#     docs/strategy-ideas.md) ------------------------------------------------
+@register_strategy
+class _BuiltInOpenLow1D(OpenLow):
+    def __init__(self):
+        super().__init__("daily")
+
+@register_strategy
+class _BuiltInOpenLow1W(OpenLow):
+    def __init__(self):
+        super().__init__("weekly")
+
+@register_strategy
+class _BuiltInOpenLow1M(OpenLow):
+    def __init__(self):
+        super().__init__("monthly")
 
 # --- TEST BENCH (feature/bb-pivot-test branch only — NOT in production) -----
 @register_strategy
