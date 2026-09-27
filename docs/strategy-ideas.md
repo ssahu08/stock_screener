@@ -91,7 +91,143 @@ own example, 2021-02-26 `O==L ✓ | ST bull ✓ | 1.3×avg ✓`**.
 
 ---
 
-## 2. Other standing backlog (BRD P4 / TDD roadmap)
+## 2. DOJI Candle Watch (test strategy) — BUILT · CALIBRATED 28-Sep-2026
+
+**Status:** spec clarified, rule calibrated against the owner's chart marks, tool built —
+`strategies/doji.py` + `tools/doji_scanner.py` + `tests/test_doji.py` (74/74 checks).
+**Test-only — must NOT reach the prod app** (standalone tool, no registry/app/scheduler
+wiring; cloud deploys `main`, this lives on the feature branch).
+Pending: owner's threshold/volume decision (see “Open decision” below) + first live day.
+
+### Owner's original brief (verbatim, 27-Sep-2026)
+
+> I want a build a test strategy to find out DOJI candles for timeframes
+> (2 times a day notification) 10min, (EOD) 1 hour, 1 D, 1 W, 1 M.
+> Scope- Nifty 50 only
+> No need to add to prod application.
+
+### Owner's clarifications (verbatim, 28-Sep-2026)
+
+> Live scan throughout the day at regular intervals (should capture all dojis formed before this time).
+> (Additonal) - Good to have Doji at lower BB and above a pivot/support
+> It will be used as informational watchlist
+> 1W / 1M - Completed candle
+> Telegram during testing to get notified
+> I would read these signals and learn to create a strategy out of it.
+> Objective behind this one- To catch these doji formations and get alerts ( as per my
+> observations generally these gets create at 10:25 AM, 11:35 AM, 12:15PM, 13:35PM )
+> We can extend scope for Nifty 100 as well.
+
+### Spec (as understood)
+
+| Item | Decision |
+|---|---|
+| Pattern | DOJI on **10min** (intraday) + **60min / 1D / 1W / 1M** (EOD) |
+| Doji rule (owner) | **body ≤ 10% of (high−low)**, inclusive; no colour condition (“black doji” = the yellow-marked pattern) |
+| Intraday behaviour | **Live scan at regular intervals all day** (default every 15 min); each scan catches **all dojis formed up to that time** (catch-up on completed bars, deduped — same-day window) |
+| Observed formation times (owner) | 10:25, 11:35, 12:15, 13:35 IST — all on the 9:15+10n candle grid → scan cadence must cover them |
+| Notification (owner) | **Send on every scan that has new finds** — one message per scan, each doji reported **once ever** (state `data/doji_state.json`); 1H/1D/1W/1M = **EOD pass** (15:45) |
+| Higher TFs | 1W / 1M = **last completed candle only** (no in-progress); 1D = today after 15:30, else last completed |
+| Purpose | **Informational watchlist** — no buy/sell semantics; owner reads signals to learn toward a future strategy |
+| Context (owner) | **Tag, not filter**: 📉 lower-BB(20,2) touch + 🛟 within ±0.5% of P/S1/S2/S3 (prev session's daily pivots intraday; prev candle on 1D/1W/1M) |
+| Universe | **Nifty 50** default (48 unique symbols today), **extendable to Nifty 100** (`--universe` stub errors until wired) |
+| Production | **Never** — standalone test tool on feature branch, not registered in the app |
+
+### Chart examples — calibration ground truth (owner's yellow marks, 28-Sep)
+
+All **10-minute** Zerodha charts; marked candles = the definition of "doji" to match:
+
+| Symbol | Visible dates | Notes |
+|---|---|---|
+| COALINDIA | 21/09–24/09 (2026) | several marks, incl. gap-up area 22/09; RSI pane, no BB on chart |
+| TATAPPOWER | 12/08–17/08 (2026) | marks near **lower BB**; BB study visible |
+| FEDERALBNK | (vertical line, dates not shown) | 3 marks — one at mid dip, two near top-right |
+| CASTROLIND | (squeeze visible) | 1 mark inside BB squeeze |
+| BANKBARODA | (lower-BB dip) | 1 mark at decline into **lower BB** |
+
+Note: FEDERALBNK / CASTROLIND are outside Nifty 50 → supports the Nifty-100 extension.
+“Black doji” clarified by owner: **just the yellow-marked pattern** — no colour rule.
+
+### Calibration decisions (owner, via questionnaire, 28-Sep-2026)
+
+1. Doji rule: **body ≤10% of range** (classic, inclusive) — calibrate on the marks, decide with numbers
+2. Context: **tag, not filter** — every doji listed, context as badges
+3. “Black doji”: **just the yellow-marked pattern** — no colour condition
+4. 10-min cadence: **send on every scan with new finds** (each doji reported once)
+
+### Calibration results (measured 28-Sep-2026, Fyers 10-min, vs the owner's marks)
+
+Match vs the yellow marks (rule = body ≤10% of range):
+
+| Mark | Result |
+|---|---|
+| COALINDIA 24/09 cluster (~419–421) | ✅ 4 zero-body dojis at 420.05–421.25 + one at 7.7% — matches the cluster |
+| COALINDIA 21/09 (~410.5), 22/09 (~424.5) | ✅ 0–9.1% candidates within ±1% of the marked prices (screenshot price-reading ±) |
+| TATAPOWER 12/08 (~376), 13/08 (~379), 14/08 (~384) | ✅ exact-date candidates at **0.0–8.3%** body/range |
+| TATAPOWER 17/08 (~380) | ⚠️ best that day = **12.5%** — rule misses it. Notably that day's candidates at the owner's observed times **10:25 / 12:15 / 13:35 IST** are 12.5–22.2% (quiet small candles) → threshold edge case, owner to verify against screenshot |
+| FEDERALBNK / CASTROLIND / BANKBARODA (no dates on screenshots) | ✅ ≤0% candidates at every marked price level (dates listed in scan output) |
+
+Noise rates (Fyers, 5 example symbols, per stock per day):
+
+| Threshold | ≤5% | **≤10% (current)** | ≤15% | ≤25% |
+|---|---|---|---|---|
+| dojis/stock/day | 2.3 | **4.3** | 6.8 | 11.2 |
+| ≈ Nifty-50 total/day | 110 | **208** | 325 | 535 |
+
+- **Min-range filter NOT needed** at ≤10%: “dead” candles (range < 0.25×ATR14) = **7 of 633**
+  candidates (~1%); median candidate range = 0.15–0.19% of price (0.68–0.84× ATR) — marked
+  candles all carry real wicks. `min_range_atr` stays 0 in `DojiConfig`.
+- **Bug found & fixed during calibration:** Fyers **intraday stamps are UTC** (session arrives
+  as 03:45–10:00) — `fetch_frame` now converts 10/60-min frames to naive IST, otherwise the
+  completion gate would evaluate the live forming candle and messages would print UTC times.
+  Regression-tested (74th check group in `tests/test_doji.py`).
+
+### Build checklist — DONE (28-Sep-2026)
+
+- [x] `strategies/doji.py` — pure detection: `DojiConfig`, `is_doji`, `detect_dojis`
+      (context computed over the whole frame, then filtered), BB + support tags (reuses
+      `bb_pivot_reversion._pivot_lines`), completed-candle helpers, weekly/monthly resamples,
+      Telegram formatting/chunking
+- [x] `tools/doji_scanner.py` — standalone runner: catch-up intraday scan + EOD pass,
+      dedup state (`data/doji_state.json`, per-TF age pruning), injectable fetch/send,
+      `--once | --eod | --loop [--interval N] [--eod-at HH:MM] [--no-alert] [--dry-run]
+      [--body-max N]`; dedups the duplicated ONGC; known-bad TATAMOTORS counted as fetch
+      failure, no crash; **does not touch** registry/app/scheduler
+- [x] `tests/test_doji.py` — **74/74 checks** (`python tests/test_doji.py`)
+- [x] Live smoke scan on real data: 48 syms, graceful failures, 0 state writes (`--dry-run`)
+- [ ] First live day + owner review of real alerts
+
+Run (laptop, feature branch, after `python core/auth.py`):
+
+```
+python tools/doji_scanner.py --loop            # full live day: 10m every 15 min + EOD 15:45
+python tools/doji_scanner.py --once --no-alert # one console-only scan
+python tools/doji_scanner.py --eod             # EOD pass alone (after 15:30)
+```
+
+### Open decision (28-Sep-2026, numbers presented to owner)
+
+Message volume vs the mark-match gap — owner to pick after seeing the table:
+
+1. **Stay ≤10%, 15-min scans** (as decided): ~208 dojis/day → likely **~20–25 messages/day**
+2. **30-min scans**: ~10–15 messages/day (bigger batches, same coverage)
+3. **Back to the original 2 batched digests/day** (11:45 + 15:45): 2 messages, same catch-up
+4. **Widen to ≤15%** (captures the 17/08 TATAPOWER candles): +56% volume (~325/day)
+
+### Building blocks available
+
+- `strategies/utils/indicators.py` (no doji helper yet — needs `body/range` ratio); BB + pivot
+  logic exists in `strategies/bb_pivot_reversion.py`
+- `core/alerts.py → send_telegram_alert()`; **do NOT touch `core/scheduler.py`** (prod — cloud
+  runs it from `main`); standalone scanner loop instead
+- Engine frames: daily (+weekly resample), 60min fetch; **10min frame does not exist yet**
+  (needs `resolution=10` fetch — Fyers caps intraday at 100 days; today-only fetch is trivial)
+- `tools/replay_bb_pivot.py` for replaying any frame; monthly resample pattern in
+  `strategies/open_low.py`; universe via `core/data.get_nifty50_symbols()` (+Nifty-100 later)
+
+---
+
+## 3. Other standing backlog (BRD P4 / TDD roadmap)
 
 | Item | Status |
 |---|---|
