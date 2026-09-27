@@ -54,6 +54,10 @@ from strategies.doji import (
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 STATE_FILE = os.path.join(BASE_DIR, "data", "doji_state.json")
 
+# timestamp rendering per EOD section — dated candles have midnight labels
+EOD_DATE_FMT = {"60m": "%d-%b %H:%M", "1D": "%d-%b",
+                "1W": "wk %d-%b", "1M": "%b %Y"}
+
 # frame -> (Fyers resolution, lookback days). Lookbacks give BB(20) + previous
 # session's pivots enough context; 10-min history cap on Fyers is 100 days.
 RES_BY_TF = {"10m": "10", "60m": "60", "1D": "1D"}
@@ -189,7 +193,8 @@ def build_eod_message(sections: dict, now: datetime.datetime,
         if not items:
             continue
         lines.append(f"{tf} ({len(items)}):")
-        lines += [format_doji_line(d, with_date=True) for d in items]
+        lines += [format_doji_line(d, with_date=True, date_fmt=EOD_DATE_FMT.get(tf))
+                  for d in items]
     footer = "(reported once — EOD DOJI test digest)"
     return chunk_messages(header, lines, footer)
 
@@ -346,7 +351,8 @@ def eod_once(fyers, symbols: list, cfg: DojiConfig, now: datetime.datetime,
         print(f"[{now:%H:%M}] EOD pass: {counts} | delivered={sent_ok}{flag}")
         for tf, items in sections.items():
             for d, _ in items:
-                print("   " + format_doji_line(d, with_date=True))
+                print("   " + format_doji_line(d, with_date=True,
+                                               date_fmt=EOD_DATE_FMT.get(tf)))
     return {"new": total_new, "delivered": sent_ok, "failures": failures}
 
 

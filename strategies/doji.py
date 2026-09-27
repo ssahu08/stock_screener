@@ -215,9 +215,20 @@ def resample_monthly(df_daily: pd.DataFrame) -> pd.DataFrame:
 # Telegram formatting
 # ----------------------------------------------------------------------
 
-def format_doji_line(d: dict, with_date: bool = True) -> str:
-    """One bullet for a doji dict: sym, ts, close, body_rng, tags."""
-    when = d["ts"].strftime("%d-%b %H:%M") if with_date else d["ts"].strftime("%H:%M")
+def format_doji_line(d: dict, with_date: bool = True,
+                     date_fmt: str = None) -> str:
+    """One bullet for a doji dict: sym, ts, close, body_rng, tags.
+
+    date_fmt overrides the timestamp rendering per timeframe (EOD sections),
+    e.g. 60m '%d-%b %H:%M', 1D '%d-%b', 1W 'wk %d-%b', 1M '%b %Y' — dated
+    candles carry a midnight label, printing their time would be noise.
+    """
+    if date_fmt:
+        when = d["ts"].strftime(date_fmt)
+    elif with_date:
+        when = d["ts"].strftime("%d-%b %H:%M")
+    else:
+        when = d["ts"].strftime("%H:%M")
     line = (f"• {d['sym']} {when} ₹{d['close']:,.2f} "
             f"| body {d['body_rng'] * 100:.0f}% of range")
     tags = []

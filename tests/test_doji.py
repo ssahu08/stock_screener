@@ -264,6 +264,12 @@ eod_msg = build_eod_message({"60m": [d], "1D": [], "1W": [d2], "1M": []},
                             datetime.datetime(2026, 9, 28, 15, 45), "Nifty 50")
 check("eod message sections", "60m (1):" in eod_msg[0] and "1W (1):" in eod_msg[0]
       and "1D" not in eod_msg[0].split("\n")[1] and "1M (" not in eod_msg[0])
+check("eod lines are timeframe-aware (no 00:00 on dated candles)",
+      "wk 28-Sep" in eod_msg[0] and "28-Sep 10:25" in eod_msg[0]
+      and "00:00" not in eod_msg[0])
+mon_msg = build_eod_message({"1M": [d]}, datetime.datetime(2026, 9, 28, 15, 45), "Nifty 50")
+check("eod 1M line renders the month, not the label day",
+      "Sep 2026" in mon_msg[0] and "31-Aug" not in mon_msg[0])
 
 # ======================================================================
 # 8. State dedup + pruning
