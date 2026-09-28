@@ -41,7 +41,9 @@ from strategies.doji import (
     resample_weekly,
 )
 from tools.doji_scanner import (
+    LAST_FETCH_ERR,
     _row_dict,
+    auth_error_hint,
     build_eod_message,
     build_scan_message,
     eod_once,
@@ -506,6 +508,62 @@ check("daily stamp untouched (date convention proven by existing tools)",
       list(daily.index) == [pd.Timestamp("2026-09-28")])
 check("fetch handles empty candle payload",
       fetch_frame(_FakeFyers([]), "NSE:X-EQ", "10", 4).empty)
+
+# ======================================================================
+# 13. fetch errors are SURFACED, dead sessions abort fast (28-Sep outage)
+# ======================================================================
+print("— fetch errors / auth abort —")
+
+
+class _ErrFyers:
+    """history() returns an error payload like a dead Fyers session."""
+
+    def __init__(self, resp):
+        self._r = resp
+        self.calls = 0
+
+    def history(self, data):
+        self.calls += 1
+        return self._r
+
+
+LAST_FETCH_ERR.clear()
+check("fetch_frame: auth error -> None",
+      fetch_frame(_ErrFyers({"s": "error", "code": -16,
+                             "message": "Could not authenticate the user"}),
+                  "NSE:X-EQ", "10", 4) is None)
+check("fetch_frame: error recorded for the CLI",
+      LAST_FETCH_ERR.get("code") == -16
+      and "authenticate" in (LAST_FETCH_ERR.get("message") or ""))
+check("auth_error_hint names the fix", "python core/auth.py" in auth_error_hint())
+
+LAST_FETCH_ERR.clear()
+LAST_FETCH_ERR.update({"code": None, "message": "boom"})
+check("non-auth error -> no auth hint", auth_error_hint() == "")
+
+check("fetch success clears the last error",
+      fetch_frame(_FakeFyers([[ep1, 100, 101, 99, 100.5, 10]]),
+                  "NSE:X-EQ", "10", 4) is not None and not LAST_FETCH_ERR)
+
+with tempfile.TemporaryDirectory() as tmp:
+    calls = []
+
+    def auth_fetch(fyers, sym, resolution, days):
+        calls.append(sym)
+        LAST_FETCH_ERR.clear()
+        LAST_FETCH_ERR.update({"code": -16,
+                               "message": "Could not authenticate the user"})
+        return None
+
+    r = scan_intraday_once(None, ["NSE:A-EQ", "NSE:B-EQ", "NSE:C-EQ"],
+                           DojiConfig(), datetime.datetime(2026, 9, 28, 10, 30),
+                           {"sent": {}}, fetch_fn=auth_fetch, send_fn=fake_send,
+                           state_path=os.path.join(tmp, "state.json"),
+                           verbose=False)
+    check("dead session aborts after the first symbol (no doomed sweeps)",
+          len(calls) == 1)
+    check("auth abort reports failures, finds nothing, no crash",
+          r["new"] == 0 and r["delivered"] == 0 and r["failures"] == 1)
 
 # ======================================================================
 print()

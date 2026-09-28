@@ -94,10 +94,19 @@ own example, 2021-02-26 `O==L ✓ | ST bull ✓ | 1.3×avg ✓`**.
 ## 2. DOJI Candle Watch (test strategy) — BUILT · CALIBRATED 28-Sep-2026
 
 **Status:** spec clarified, rule calibrated against the owner's chart marks, tool built —
-`strategies/doji.py` + `tools/doji_scanner.py` + `tests/test_doji.py` (74/74 checks).
+`strategies/doji.py` + `tools/doji_scanner.py` + `tests/test_doji.py` (83/83 checks).
 **Test-only — must NOT reach the prod app** (standalone tool, no registry/app/scheduler
 wiring; cloud deploys `main`, this lives on the feature branch).
 Pending: owner's threshold/volume decision (see “Open decision” below) + first live day.
+
+**28-Sep first-live-day outage + hardening:** every 10m scan failed silently (48/48
+fetch failures, no reason shown) — laptop token died at 06:00 (Fyers kills all sessions
+daily) while `read_valid_token()` only checked file mtime, and `--loop` held ONE client
+for the whole day. Fixed: JWT `exp` validated in `core/auth.py` (both `read_valid_token`
+and auth's cached-token skip path); loop re-reads the token **every slot**, so a mid-day
+`python core/auth.py` self-heals without restart; fetch errors are now printed with an
+actionable hint (`code -16 … → run: python core/auth.py`) and the sweep aborts after the
+first symbol instead of burning 47 more doomed calls. Test count 76 → 83.
 
 ### Owner's original brief (verbatim, 27-Sep-2026)
 
@@ -193,7 +202,7 @@ Noise rates (Fyers, 5 example symbols, per stock per day):
       `--once | --eod | --loop [--interval N] [--eod-at HH:MM] [--no-alert] [--dry-run]
       [--body-max N]`; dedups the duplicated ONGC; known-bad TATAMOTORS counted as fetch
       failure, no crash; **does not touch** registry/app/scheduler
-- [x] `tests/test_doji.py` — **74/74 checks** (`python tests/test_doji.py`)
+- [x] `tests/test_doji.py` — **83/83 checks** (`python tests/test_doji.py`)
 - [x] Live smoke scan on real data: 48 syms, graceful failures, 0 state writes (`--dry-run`)
 - [ ] First live day + owner review of real alerts
 

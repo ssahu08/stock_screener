@@ -24,8 +24,11 @@ Workflow:
 - Token auto-expires daily
 """
 
-import sys
+import base64
+import json
 import os
+import sys
+import time
 import webbrowser
 from datetime import date
 from typing import Optional
@@ -35,6 +38,26 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fyers_apiv3 import fyersModel
 from config.keys import CLIENT_ID, SECRET_KEY, REDIRECT_URI
+
+
+def _token_expired(token: str) -> bool:
+    """True when the Fyers JWT's `exp` has already passed.
+
+    Fyers kills every session at the same clock time (~06:00-06:30 IST daily),
+    so a token file written after midnight can already be dead by 06:00 —
+    `mtime == today` alone is NOT enough (28-Sep: a stale token made every
+    DOJI scan fail all morning while looking "valid"). Undecodable token ->
+    not expired (caller's mtime check still applies).
+    """
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return False
+        pad = parts[1] + "=" * (-len(parts[1]) % 4)
+        exp = json.loads(base64.urlsafe_b64decode(pad)).get("exp")
+        return bool(exp) and float(exp) <= time.time() + 60  # 60s safety margin
+    except Exception:
+        return False
 
 
 def authenticate_interactive() -> Optional[str]:
@@ -59,12 +82,15 @@ def authenticate_interactive() -> Optional[str]:
     # Check if we already have a valid token for today
     if os.path.exists(token_path):
         file_date = date.fromtimestamp(os.path.getmtime(token_path))
-        if file_date == date.today():
+        with open(token_path, "r") as f:
+            cached = f.read().strip()
+        if file_date == date.today() and cached and not _token_expired(cached):
             print("✅ Found valid cached token for today. Skipping login.")
-            with open(token_path, "r") as f:
-                token = f.read().strip()
             print("✅ Token loaded successfully")
-            return token
+            return cached
+        if file_date == date.today():
+            print("⚠️  Cached token from today is already EXPIRED "
+                  "(Fyers sessions die ~06:00 IST daily) — re-authenticating…")
     
     # Step 1: Generate auth URL
     print("=" * 60)
@@ -257,6 +283,8 @@ def read_valid_token() -> Optional[str]:
 
     if not token or token == "YOUR_FYERS_ACCESS_TOKEN":
         return None
+    if _token_expired(token):
+        return None  # file may be dated today but the session died at ~06:00
     return token
 
 

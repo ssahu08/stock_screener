@@ -107,6 +107,8 @@ def prune_state(state: dict, now: datetime.datetime) -> int:
         except Exception:
             stamp = None
         if stamp is None or stamp < limit:
+            if stamp is None:
+                print(f"[doji] prune: dropping unparseable state date for {key!r}")
             del state["sent"][key]
             removed += 1
     return removed
@@ -115,6 +117,23 @@ def prune_state(state: dict, now: datetime.datetime) -> int:
 # ----------------------------------------------------------------------
 # Fetch (no min-bar rule — early-morning scans see 1-2 bars; rate-limit backoff)
 # ----------------------------------------------------------------------
+
+# Last non-ok fetch result (module-level on purpose: the CLI prints it next to
+# the bare "[N fetch failures]" count so a dead Fyers session is never silent
+# again — 28-Sep: code -16 ran from 09:33 to 10:45 with no clue shown).
+LAST_FETCH_ERR: dict = {}
+
+
+def auth_error_hint() -> str:
+    """Actionable hint when the last fetch died on session auth, else ''."""
+    msg = str(LAST_FETCH_ERR.get("message") or "")
+    code = LAST_FETCH_ERR.get("code")
+    low = msg.lower()
+    if code in (-8, -16) or "authenticat" in low or "access token" in low:
+        return (f"⚠️ Fyers session rejected ({code}: {msg}) — run: "
+                "python core/auth.py (the loop re-reads the token on the next scan)")
+    return ""
+
 
 def fetch_frame(fyers, symbol: str, resolution: str, days: int,
                 tries: int = 4) -> pd.DataFrame:
@@ -135,6 +154,7 @@ def fetch_frame(fyers, symbol: str, resolution: str, days: int,
         except Exception as exc:
             resp = {"s": "error", "message": str(exc)}
         if isinstance(resp, dict) and resp.get("s") == "ok":
+            LAST_FETCH_ERR.clear()
             candles = resp.get("candles") or []
             if not candles:
                 return pd.DataFrame()
@@ -152,6 +172,11 @@ def fetch_frame(fyers, symbol: str, resolution: str, days: int,
                             .tz_convert("Asia/Kolkata").tz_localize(None))
             return df[~df.index.duplicated(keep="last")]
         msg = (resp.get("message", "") if isinstance(resp, dict) else str(resp)) or ""
+        LAST_FETCH_ERR.clear()
+        LAST_FETCH_ERR.update({
+            "code": resp.get("code") if isinstance(resp, dict) else None,
+            "message": msg or str(resp),
+        })
         if "limit" not in msg.lower():
             break
         time.sleep(delay)
@@ -225,12 +250,15 @@ def scan_intraday_once(fyers, symbols: list, cfg: DojiConfig, now: datetime.date
     send_fn = send_fn or send_telegram_alert
     resolution = RES_BY_TF[tf]
     pivot_source = "prev_day" if tf in DAILY_PIVOT_TF else "prev_bar"
+    LAST_FETCH_ERR.clear()   # per-scan error context (fakes never touch it)
 
     new, failures = [], 0
     for sym in symbols:
         df = fetch_fn(fyers, sym, resolution, FETCH_DAYS[tf])
         if df is None:
             failures += 1
+            if auth_error_hint():
+                break          # dead session — skip the remaining symbols
             continue
         if df.empty:
             continue
@@ -264,6 +292,8 @@ def scan_intraday_once(fyers, symbols: list, cfg: DojiConfig, now: datetime.date
         flag = "" if failures == 0 else f"  [{failures} fetch failures]"
         print(f"[{now:%H:%M}] {tf} scan: {len(symbols)} syms | "
               f"{len(new)} new dojis | delivered={sent_ok}{flag}")
+        if failures and auth_error_hint():
+            print("      " + auth_error_hint())
         for d, _ in new:
             print("   " + format_doji_line(d, with_date=False))
     return {"new": len(new), "delivered": sent_ok, "failures": failures}
@@ -282,6 +312,7 @@ def eod_once(fyers, symbols: list, cfg: DojiConfig, now: datetime.datetime,
     send_fn = send_fn or send_telegram_alert
     sections = {"60m": [], "1D": [], "1W": [], "1M": []}
     failures = 0
+    LAST_FETCH_ERR.clear()   # per-pass error context
 
     def _collect(tf: str, frame: pd.DataFrame, sym: str, pivot_source: str,
                  only_date=None):
@@ -307,6 +338,8 @@ def eod_once(fyers, symbols: list, cfg: DojiConfig, now: datetime.datetime,
         sixty = fetch_fn(fyers, sym, "60", FETCH_DAYS["60m"])
         if sixty is None:
             failures += 1
+            if auth_error_hint():
+                break            # dead session — skip the remaining symbols
         elif not sixty.empty:
             ctx60 = completed_intraday(sixty, now, BAR_MIN["60m"])
             if not ctx60.empty:
@@ -316,6 +349,8 @@ def eod_once(fyers, symbols: list, cfg: DojiConfig, now: datetime.datetime,
         daily = fetch_fn(fyers, sym, "1D", FETCH_DAYS["1D"])
         if daily is None:
             failures += 1
+            if auth_error_hint():
+                break
             continue
         if daily.empty:
             continue
@@ -349,6 +384,8 @@ def eod_once(fyers, symbols: list, cfg: DojiConfig, now: datetime.datetime,
         counts = " | ".join(f"{tf}:{len(v)}" for tf, v in sections.items())
         flag = "" if failures == 0 else f"  [{failures} fetch failures]"
         print(f"[{now:%H:%M}] EOD pass: {counts} | delivered={sent_ok}{flag}")
+        if failures and auth_error_hint():
+            print("      " + auth_error_hint())
         for tf, items in sections.items():
             for d, _ in items:
                 print("   " + format_doji_line(d, with_date=True,
@@ -360,41 +397,63 @@ def eod_once(fyers, symbols: list, cfg: DojiConfig, now: datetime.datetime,
 # Loop + CLI
 # ----------------------------------------------------------------------
 
-def run_loop(fyers, symbols: list, cfg: DojiConfig, args) -> None:
+def run_loop(client_factory, symbols: list, cfg: DojiConfig, args) -> None:
+    """`client_factory` (engine.get_fyers_client) is called EVERY slot so a
+    mid-day `python core/auth.py` is picked up on the next scan — the loop
+    never keeps a dead Fyers session in memory (28-Sep outage cause)."""
     interval = max(1, args.interval)
     eod_h, eod_m = (int(x) for x in args.eod_at.split(":"))
+    eod_start = eod_h * 60 + eod_m
+    eod_deadline = eod_start + 45      # keep retrying a dead session this long
     state = load_state(args.state or STATE_FILE)
     universe_label = "Nifty 50" if args.universe == "nifty50" else args.universe
-    last_slot, eod_date = -1, None
+    last_slot, eod_slot, eod_date = -1, -1, None
     print(f"[doji] loop started: 10m every {interval}m (09:10-15:35 IST), "
           f"EOD at {args.eod_at} (60m/1D/1W/1M), alerts {'OFF' if args.no_alert else 'ON'}")
     while True:
         now = datetime.datetime.now(IST)
         if now.weekday() < 5:                       # Mon-Fri (holidays -> 0 finds)
             minutes = now.hour * 60 + now.minute
-            if 9 * 60 + 10 <= minutes <= 15 * 60 + 35:
-                slot = minutes // interval
-                if slot != last_slot:
-                    last_slot = slot
-                    try:
-                        scan_intraday_once(
-                            fyers, symbols, cfg, now, state, "10m",
-                            no_alert=args.no_alert, dry_run=args.dry_run,
-                            universe_label=universe_label,
-                            state_path=args.state or STATE_FILE)
-                    except Exception as exc:
-                        print(f"[doji] 10m scan error: {exc}")
+            slot = minutes // interval
+            if slot != last_slot:
+                last_slot = slot
+                if 9 * 60 + 10 <= minutes <= 15 * 60 + 35:
+                    fyers = client_factory()
+                    if fyers is None:
+                        print(f"[{now:%H:%M}] 10m scan SKIPPED — no valid Fyers "
+                              "token; run: python core/auth.py (retries next scan)")
+                    else:
+                        try:
+                            scan_intraday_once(
+                                fyers, symbols, cfg, now, state, "10m",
+                                no_alert=args.no_alert, dry_run=args.dry_run,
+                                universe_label=universe_label,
+                                state_path=args.state or STATE_FILE)
+                        except Exception as exc:
+                            print(f"[doji] 10m scan error: {exc}")
             if not args.no_eod and eod_date != now.date() and \
-                    minutes >= eod_h * 60 + eod_m:
-                eod_date = now.date()
-                try:
-                    eod_once(
-                        fyers, symbols, cfg, now, state,
-                        no_alert=args.no_alert, dry_run=args.dry_run,
-                        universe_label=universe_label,
-                        state_path=args.state or STATE_FILE)
-                except Exception as exc:
-                    print(f"[doji] EOD error: {exc}")
+                    minutes >= eod_start and slot != eod_slot:
+                eod_slot = slot
+                if minutes > eod_deadline:
+                    eod_date = now.date()
+                    print(f"[{now:%H:%M}] EOD MISSED — no valid token past "
+                          f"{args.eod_at}+45m; run: "
+                          "python tools/doji_scanner.py --eod")
+                else:
+                    fyers = client_factory()
+                    if fyers is None:
+                        print(f"[{now:%H:%M}] EOD waiting — no valid Fyers "
+                              "token; run: python core/auth.py (retries each slot)")
+                    else:
+                        eod_date = now.date()
+                        try:
+                            eod_once(
+                                fyers, symbols, cfg, now, state,
+                                no_alert=args.no_alert, dry_run=args.dry_run,
+                                universe_label=universe_label,
+                                state_path=args.state or STATE_FILE)
+                        except Exception as exc:
+                            print(f"[doji] EOD error: {exc}")
         time.sleep(15)
 
 
@@ -424,10 +483,6 @@ def main(argv=None) -> int:
         args.once = True
 
     from engine import get_fyers_client
-    fyers = get_fyers_client()
-    if fyers is None:
-        print("No Fyers token — run: python core/auth.py")
-        return 2
 
     symbols = list(dict.fromkeys(get_nifty50_symbols()))  # dedup (ONGC listed twice)
     cfg = DojiConfig(body_max_pct=args.body_max)
@@ -435,8 +490,15 @@ def main(argv=None) -> int:
     now = datetime.datetime.now(IST)
 
     if args.loop:
-        run_loop(fyers, symbols, cfg, args)
+        # No upfront token check: the loop re-reads the token every slot, so it
+        # can start before login and self-heal right after `python core/auth.py`.
+        run_loop(get_fyers_client, symbols, cfg, args)
         return 0
+
+    fyers = get_fyers_client()
+    if fyers is None:
+        print("No Fyers token — run: python core/auth.py")
+        return 2
     state = load_state(args.state or STATE_FILE)
     if args.eod:
         eod_once(fyers, symbols, cfg, now, state,
