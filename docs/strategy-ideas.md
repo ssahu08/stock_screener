@@ -91,6 +91,28 @@ own example, 2021-02-26 `O==L ✓ | ST bull ✓ | 1.3×avg ✓`**.
 
 ---
 
+### 1d. Day-start intraday variant — owner brief verbatim (29-Sep-2026)
+
+> I need a open_low strategy so that it first triggers a scan on first 10 minute
+> candle to catch the day start Open=Low + Super trend in bullish + Sort by
+> highest volume. This will be intraday scanner same on the feature/bb-pivot-test.
+> Need to run and test in 30 minutes
+
+Decisions as built — `tools/open_low_intraday.py` + `tests/test_open_low_intraday.py`
+(**24/24**), standalone like DOJI (no registry/app/scheduler — test-only):
+
+| Piece | Decision |
+|---|---|
+| Trigger | Day's first 10-min bar (09:15–09:25) completed → fires **09:26 IST** (`--at HH:MM` overrides). `--loop` = once per day with self-healing token + 5-min retry until success; `--once` = catch-up any time after 09:26 (before → exit 3) |
+| Signal | TODAY's **first 10-min candle `Open == Low`** (exact — 1D/1W calibration; `--wick-pct N` relaxes, 0 default) **AND daily Supertrend(10,3) trend BULLISH** (flip recency in metrics) |
+| Rank | First-candle volume descending, **top-5** (`--top N`) |
+| Data | Per symbol: Fyers 10m (2d, subject) + 1D (300d, ST gate) — 2 fetches |
+| Alerts | One Telegram message per day (chunked, details per line); `--no-alert` / `--dry-run` |
+| Reuse | `tools.doji_scanner.fetch_frame` + auth fail-fast/hint (28-Sep fix) — single fetch implementation for both scanners |
+| Status | Built 29-Sep pre-open; live trigger test same day 09:26 |
+
+---
+
 ## 2. DOJI Candle Watch (test strategy) — BUILT · CALIBRATED 28-Sep-2026
 
 **Status:** spec clarified, rule calibrated against the owner's chart marks, tool built —
